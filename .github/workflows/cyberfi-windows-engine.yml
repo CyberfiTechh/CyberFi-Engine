@@ -1,0 +1,43 @@
+name: Build CyberFi Windows engine
+
+on:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: cyberfi-windows-engine-0.4.115
+    cancel-in-progress: false
+
+jobs:
+    windows:
+        uses: ./.github/workflows/build-windows.yml
+        permissions:
+            contents: read
+            id-token: write
+        with:
+            version: "0.4.115"
+
+    publish:
+        needs: windows
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: happy-agent-win32-x64
+                  path: release-assets
+            - name: Verify and publish Windows-only build
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  cd release-assets
+                  sha256sum -c happy-agent-0.4.115-win32-x64.tar.gz.sha256
+                  gh release create v0.4.115 --repo "$GITHUB_REPOSITORY" \
+                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.115 (Windows x64)" \
+                    --notes "Windows notification-area branding rebuilt from Happy Agent v0.4.114 (MIT), commit 3d672e414d70804cf9f1b20b44d7243c78e063c3. The original v0.4.114 release remains the default for other platforms." \
+                    happy-agent-0.4.115-win32-x64.tar.gz happy-agent-0.4.115-win32-x64.tar.gz.sha256
+                  gh release edit v0.4.115 --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
