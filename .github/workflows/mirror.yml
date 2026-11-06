@@ -1,0 +1,29 @@
+name: Mirror CyberFi engine
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: CyberfiTechh/CyberFi-Engine
+    steps:
+      - name: Verify upstream archives and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=v0.4.114
+          cd "$(mktemp -d)"
+          gh release download "$tag" --repo slopus/happy-agent --pattern '*.tar.gz'
+          sha256sum -c <<'HASHES'
+          eb15fc0ceaf5519372efe8142da791c923992f698e8081fdae65b656f0c6bab4  happy-agent-0.4.114-darwin-arm64.tar.gz
+          440c7ca93128056332114d7126ec0c2414d1c80e4e384cec08a7093020fa70cb  happy-agent-0.4.114-darwin-x64.tar.gz
+          7b46908682d85f58a08488dff3136c9fee2ce15adac63a0711dac161e10d6ee8  happy-agent-0.4.114-linux-arm64.tar.gz
+          2ee0193ea94dc60f6ad3e21518d32733aba1a5cc5c3afdf59f17dd5181c270be  happy-agent-0.4.114-linux-x64.tar.gz
+          089c9f109798597f752fc07dd0108817145c30484af32fd4bdd113dceb43153f  happy-agent-0.4.114-win32-x64.tar.gz
+          HASHES
+          gh release create "$tag" --repo "$GH_REPO" --draft --title "CyberFi ajan motoru 0.4.114" --notes "Doğrulanmış dağıtım kopyası. Özgün motor, lisans ve kaynak: https://github.com/slopus/happy-agent/releases/tag/v0.4.114."
+          gh release upload "$tag" --repo "$GH_REPO" *.tar.gz
+          gh release edit "$tag" --repo "$GH_REPO" --draft=false --latest
