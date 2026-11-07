@@ -7,19 +7,21 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-windows-engine-0.4.115
+    group: cyberfi-windows-engine-0.4.116
     cancel-in-progress: false
 
 jobs:
     windows:
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
         uses: ./.github/workflows/build-windows.yml
         permissions:
             contents: read
             id-token: write
         with:
-            version: "0.4.115"
+            version: "0.4.116"
 
     publish:
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
         needs: windows
         runs-on: ubuntu-24.04
         permissions:
@@ -35,9 +37,9 @@ jobs:
               run: |
                   set -euo pipefail
                   cd release-assets
-                  sha256sum -c happy-agent-0.4.115-win32-x64.tar.gz.sha256
-                  gh release create v0.4.115 --repo "$GITHUB_REPOSITORY" \
-                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.115 (Windows x64)" \
-                    --notes "Windows notification-area branding rebuilt from Happy Agent v0.4.114 (MIT), commit 3d672e414d70804cf9f1b20b44d7243c78e063c3. The original v0.4.114 release remains the default for other platforms." \
-                    happy-agent-0.4.115-win32-x64.tar.gz happy-agent-0.4.115-win32-x64.tar.gz.sha256
-                  gh release edit v0.4.115 --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+                  sha256sum -c happy-agent-0.4.116-win32-x64.tar.gz.sha256
+                  gh release create v0.4.116 --repo "$GITHUB_REPOSITORY" \
+                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.116 (Windows x64)" \
+                    --notes "CyberFi simgesi ve Türkçe Windows tepsisi. Kaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Doğrulanan macOS paketleri aynı yeni sürüme ayrıca eklenir; önceki sürüm varlıkları değiştirilmez." \
+                    happy-agent-0.4.116-win32-x64.tar.gz happy-agent-0.4.116-win32-x64.tar.gz.sha256
+                  gh release edit v0.4.116 --repo "$GITHUB_REPOSITORY" --draft=false --latest=false

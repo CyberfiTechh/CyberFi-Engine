@@ -131,6 +131,12 @@ jobs:
             - name: Install dependencies
               # Cache downloads only; patched native addons must run their install scripts again.
               run: pnpm install --frozen-lockfile --config.side-effects-cache=false
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  path: cyberfi-overlay
+                  persist-credentials: false
+            - name: Apply CyberFi tray and voice defaults before compiling JavaScript
+              run: ./cyberfi-overlay/windows/Markala-Windows-Tepsisi.ps1 -EngineSource .
             - name: Build workspace JavaScript
               run: pnpm build
             - name: Verify source named-pipe transports before signing and compiling
@@ -168,6 +174,8 @@ jobs:
                   copyFileSync('packages/happy-agent/native/target/win32-x64/libsql.node', destination);
                   '@ | node
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Verify voice settings and custom prompt preservation
+              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts
             - name: Authenticate signing with GitHub OIDC
               if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
               uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
@@ -184,14 +192,14 @@ jobs:
             - name: Verify the Bun runtime before compiling
               run: pnpm --filter @slopus/happy-agent test:bun:runtime
 
-            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-              with:
-                  path: cyberfi-overlay
-                  persist-credentials: false
-            - name: Apply CyberFi notification-area assets
-              run: ./cyberfi-overlay/windows/Markala-Windows-Tepsisi.ps1 -EngineSource .
             - name: Build standalone executable with signed embedded native assets when enabled
               run: pnpm --filter @slopus/happy-agent build:bun --target win32-x64
+            - name: Verify compiled CyberFi tray icon and product metadata
+              run: |
+                  node cyberfi-overlay/branding/verify.mjs . win32
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  $tray = Get-Item packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-win32-x64.exe
+                  if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne '0.4.116.0') { throw 'Native tray metadata mismatch' }
             - name: Sign and verify the standalone executable
               if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
               run: ./scripts/sign-windows-files.ps1 -Directory packages/happy-agent/dist/bin
@@ -242,6 +250,7 @@ jobs:
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   $hash = (Get-FileHash "release-assets/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
                   "$hash  $name" | Set-Content "release-assets/$name.sha256" -Encoding ascii
+                  Copy-Item cyberfi-tray-branding-proof.json "release-assets/$name.branding-proof.json"
                   $signing = if ($env:HAPPY_WINDOWS_SIGNING_ENABLED -eq 'true') { 'Signed' } else { 'Unsigned' }
                   "$signing Windows x64 Agent: ``$name`` (SHA-256 ``$hash``)." >> $env:GITHUB_STEP_SUMMARY
             - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

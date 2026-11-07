@@ -1,0 +1,17 @@
+{
+  "sourceSha256": "d576b97d3d7821d05d8647e0f52af64ff8a6d0d8e83e6bbb281d81aacd85e461",
+  "pngSha256": "c1de4c4ef376fe913eafc66f29e69072589308a545ac81c04c1c8fa20531c8ab",
+  "icoSha256": "4a250f93b0dc6bdab1080ea149711dcb0ea6195f22fb4e758107c399fbeca5bc",
+  "sizes": [
+    16,
+    20,
+    24,
+    32,
+    40,
+    48,
+    64,
+    128,
+    256
+  ],
+  "derivation": "Approved source pixels; transparent trim, contain resize, one-pixel transparent border. Spiral and white circuitry retained."
+}

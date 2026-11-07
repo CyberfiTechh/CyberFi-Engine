@@ -7,11 +7,11 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-macos-engine-0.4.115
+    group: cyberfi-macos-engine-0.4.116
     cancel-in-progress: false
 
 env:
-    HAPPY_AGENT_RELEASE_VERSION: "0.4.115"
+    HAPPY_AGENT_RELEASE_VERSION: "0.4.116"
 
 jobs:
     macos:
@@ -57,6 +57,12 @@ jobs:
                   key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node${{ steps.store.outputs.abi }}-${{ hashFiles('pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'patches/**') }}
             - name: Install and rebuild patched native dependencies
               run: pnpm install --frozen-lockfile --config.side-effects-cache=false
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  path: cyberfi-overlay
+                  persist-credentials: false
+            - name: Apply CyberFi tray and voice defaults before compiling JavaScript
+              run: node cyberfi-overlay/macos/markala-macos.mjs .
             - name: Build workspace JavaScript
               run: |
                   pnpm --filter @slopus/happy-agent-supervisor build
@@ -83,20 +89,22 @@ jobs:
                   ulimit -n 16384
                   node --expose-gc packages/happy-agent/scripts/verify-native-libsql.mjs
                   pnpm --filter @slopus/happy-agent exec pnpm dlx bun@1.4.4 scripts/verify-native-libsql.mjs
+            - name: Verify voice settings and custom prompt preservation
+              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts
             - name: Build and verify the owned native Python worker
               uses: ./.github/actions/build-monty
             - name: Verify patched watcher and Bun runtime
               run: |
                   pnpm --filter @slopus/happy-agent test:native:watcher
                   pnpm --filter @slopus/happy-agent test:bun:runtime
-            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-              with:
-                  path: cyberfi-overlay
-                  persist-credentials: false
-            - name: Apply CyberFi menu text
-              run: node cyberfi-overlay/macos/markala-macos.mjs .
             - name: Compile the matching native standalone engine
               run: pnpm --filter @slopus/happy-agent build:bun --target "$TARGET"
+            - name: Verify compiled CyberFi tray pixels and native identity
+              run: |
+                  node cyberfi-overlay/branding/verify.mjs . darwin
+                  tray="packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-$TARGET"
+                  codesign --verify --strict --verbose=2 "$tray"
+                  codesign --display --verbose=2 "$tray" 2>&1 | grep '^Signature=adhoc$'
             - name: Ad-hoc sign and verify the compiled executable
               run: |
                   binary="packages/happy-agent/dist/bin/happy-agent-$TARGET"
@@ -133,6 +141,7 @@ jobs:
                   tar -czf "release-assets/$archive" -C packages/happy-agent/dist/bin "happy-agent-$TARGET"
                   cd release-assets
                   shasum -a 256 "$archive" > "$archive.sha256"
+                  cp ../cyberfi-tray-branding-proof.json "$archive.branding-proof.json"
                   echo "Native $TARGET engine passed transport and lifecycle checks; ad-hoc signed, not notarized." >> "$GITHUB_STEP_SUMMARY"
             - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
@@ -142,6 +151,7 @@ jobs:
                   retention-days: 7
 
     publish:
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
         needs: macos
         runs-on: ubuntu-24.04
         permissions:
@@ -168,12 +178,12 @@ jobs:
                   release="repos/$GITHUB_REPOSITORY/releases/tags/v$HAPPY_AGENT_RELEASE_VERSION"
                   gh api "$release" > before.json
                   jq -e '.draft == false and .prerelease == false' before.json > /dev/null
-                  jq -e '.assets | any(.name == "happy-agent-0.4.115-win32-x64.tar.gz")' before.json > /dev/null
+                  jq -e '.assets | any(.name == "happy-agent-0.4.116-win32-x64.tar.gz")' before.json > /dev/null
                   jq -e '.assets | all(.name | contains("darwin-") | not)' before.json > /dev/null
                   jq -S '[.assets[] | {id, name, size, digest, browser_download_url}] | sort_by(.id)' before.json > preserved.json
                   gh release upload "v$HAPPY_AGENT_RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
-                    happy-agent-0.4.115-darwin-x64.tar.gz happy-agent-0.4.115-darwin-x64.tar.gz.sha256 \
-                    happy-agent-0.4.115-darwin-arm64.tar.gz happy-agent-0.4.115-darwin-arm64.tar.gz.sha256
+                    happy-agent-0.4.116-darwin-x64.tar.gz happy-agent-0.4.116-darwin-x64.tar.gz.sha256 \
+                    happy-agent-0.4.116-darwin-arm64.tar.gz happy-agent-0.4.116-darwin-arm64.tar.gz.sha256
                   gh api "$release" > after.json
                   jq -S '[.assets[] | select(.name | contains("darwin-") | not) | {id, name, size, digest, browser_download_url}] | sort_by(.id)' after.json > retained.json
                   cmp preserved.json retained.json
@@ -182,4 +192,4 @@ jobs:
                       jq -e --arg name "$archive" --arg digest "sha256:$digest" \
                         '.assets | any(.name == $name and .digest == $digest)' after.json > /dev/null
                   done
-                  echo 'Added verified native Mac archives to v0.4.115; existing release assets retained.' >> "$GITHUB_STEP_SUMMARY"
+                  echo 'Added verified native Mac archives to v0.4.116; existing release assets retained.' >> "$GITHUB_STEP_SUMMARY"
