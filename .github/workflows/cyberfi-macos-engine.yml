@@ -1,0 +1,185 @@
+name: Build CyberFi macOS engine
+
+on:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: cyberfi-macos-engine-0.4.115
+    cancel-in-progress: false
+
+env:
+    HAPPY_AGENT_RELEASE_VERSION: "0.4.115"
+
+jobs:
+    macos:
+        name: Build and exercise ${{ matrix.target }}
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 90
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - runner: macos-15
+                      target: darwin-arm64
+                    - runner: macos-15-intel
+                      target: darwin-x64
+        env:
+            TARGET: ${{ matrix.target }}
+        steps:
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  repository: slopus/happy-agent
+                  ref: 3d672e414d70804cf9f1b20b44d7243c78e063c3
+                  persist-credentials: false
+            - name: Require the public distribution repository and main
+              run: |
+                  test "$GITHUB_REPOSITORY" = CyberfiTechh/CyberFi-Engine
+                  test "$GITHUB_REF" = refs/heads/main
+                  test "$(git rev-parse HEAD)" = 3d672e414d70804cf9f1b20b44d7243c78e063c3
+                  test "$(node -p 'process.platform + "-" + process.arch')" = "$TARGET"
+            - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+            - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+              with:
+                  node-version: "24"
+                  package-manager-cache: false
+            - name: Locate dependency downloads
+              id: store
+              run: |
+                  echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+                  echo "abi=$(node -p 'process.versions.modules')" >> "$GITHUB_OUTPUT"
+            - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+              with:
+                  path: ${{ steps.store.outputs.path }}
+                  key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node${{ steps.store.outputs.abi }}-${{ hashFiles('pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'patches/**') }}
+            - name: Install and rebuild patched native dependencies
+              run: pnpm install --frozen-lockfile --config.side-effects-cache=false
+            - name: Build workspace JavaScript
+              run: |
+                  pnpm --filter @slopus/happy-agent-supervisor build
+                  pnpm --filter @slopus/happy-providers build
+                  pnpm --filter @slopus/happy-agent-compute build
+                  pnpm --filter @slopus/happy-agent-modules build
+                  pnpm --filter @slopus/happy-agent build
+            - name: Identify pinned database build inputs
+              id: libsql
+              run: |
+                  toolchain="$(node -p 'JSON.parse(require("node:fs").readFileSync("packages/happy-agent/native/libsql/source.json")).toolchain')"
+                  rustup toolchain install "$toolchain" --profile minimal
+                  echo "key=$(node scripts/release/nativeLibsqlCacheKey.mjs)" >> "$GITHUB_OUTPUT"
+            - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+              id: libsql-cache
+              with:
+                  path: packages/happy-agent/native/target/${{ matrix.target }}/libsql.node
+                  key: ${{ steps.libsql.outputs.key }}
+            - name: Build the pinned patched database binding
+              if: steps.libsql-cache.outputs.cache-hit != 'true'
+              run: pnpm --filter @slopus/happy-agent build:native:libsql
+            - name: Verify database lifetimes under Node and Bun
+              run: |
+                  ulimit -n 16384
+                  node --expose-gc packages/happy-agent/scripts/verify-native-libsql.mjs
+                  pnpm --filter @slopus/happy-agent exec pnpm dlx bun@1.4.4 scripts/verify-native-libsql.mjs
+            - name: Build and verify the owned native Python worker
+              uses: ./.github/actions/build-monty
+            - name: Verify patched watcher and Bun runtime
+              run: |
+                  pnpm --filter @slopus/happy-agent test:native:watcher
+                  pnpm --filter @slopus/happy-agent test:bun:runtime
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  path: cyberfi-overlay
+                  persist-credentials: false
+            - name: Apply CyberFi menu text
+              run: node cyberfi-overlay/macos/markala-macos.mjs .
+            - name: Compile the matching native standalone engine
+              run: pnpm --filter @slopus/happy-agent build:bun --target "$TARGET"
+            - name: Ad-hoc sign and verify the compiled executable
+              run: |
+                  binary="packages/happy-agent/dist/bin/happy-agent-$TARGET"
+                  lipo -verify_arch "$(uname -m)" "$binary"
+                  codesign --force --sign - --identifier tr.pdrkocum.agent.engine \
+                    --entitlements packages/happy-agent/assets/macos/entitlements.plist "$binary"
+                  codesign --verify --strict --verbose=2 "$binary"
+                  codesign --display --verbose=2 "$binary" 2>&1 | grep '^Signature=adhoc$'
+            - name: Exercise the actual native release binary
+              run: |
+                  binary="$PWD/packages/happy-agent/dist/bin/happy-agent-$TARGET"
+                  test "$("$binary" --version)" = "Happy Agent $HAPPY_AGENT_RELEASE_VERSION"
+                  "$binary" --help > /dev/null
+                  node packages/happy-agent/scripts/smoke-binary-transports.mjs "$binary"
+                  export HAPPY_HOME_DIR="$(mktemp -d /tmp/cyberfi-engine.XXXXXX)/home"
+                  trap '"$binary" stop >/dev/null 2>&1 || true' EXIT
+                  "$binary" start
+                  "$binary" status
+                  "$binary" stop
+                  for attempt in {1..100}; do
+                      status_output="$("$binary" status)"
+                      if [[ "$status_output" == *"Daemon is not running."* ]]; then
+                          trap - EXIT
+                          exit 0
+                      fi
+                      sleep 0.1
+                  done
+                  echo "$status_output" >&2
+                  exit 1
+            - name: Package the tested executable and checksum
+              run: |
+                  mkdir -p release-assets
+                  archive="happy-agent-$HAPPY_AGENT_RELEASE_VERSION-$TARGET.tar.gz"
+                  tar -czf "release-assets/$archive" -C packages/happy-agent/dist/bin "happy-agent-$TARGET"
+                  cd release-assets
+                  shasum -a 256 "$archive" > "$archive.sha256"
+                  echo "Native $TARGET engine passed transport and lifecycle checks; ad-hoc signed, not notarized." >> "$GITHUB_STEP_SUMMARY"
+            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: happy-agent-${{ matrix.target }}
+                  path: release-assets/*
+                  if-no-files-found: error
+                  retention-days: 7
+
+    publish:
+        needs: macos
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  pattern: happy-agent-darwin-*
+                  merge-multiple: true
+                  path: release-assets
+            - name: Add only missing Mac assets to the existing release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  test "$GITHUB_REPOSITORY" = CyberfiTechh/CyberFi-Engine
+                  test "$GITHUB_REF" = refs/heads/main
+                  cd release-assets
+                  for target in darwin-x64 darwin-arm64; do
+                      archive="happy-agent-$HAPPY_AGENT_RELEASE_VERSION-$target.tar.gz"
+                      sha256sum -c "$archive.sha256"
+                      test "$(tar -tzf "$archive")" = "happy-agent-$target"
+                  done
+                  release="repos/$GITHUB_REPOSITORY/releases/tags/v$HAPPY_AGENT_RELEASE_VERSION"
+                  gh api "$release" > before.json
+                  jq -e '.draft == false and .prerelease == false' before.json > /dev/null
+                  jq -e '.assets | any(.name == "happy-agent-0.4.115-win32-x64.tar.gz")' before.json > /dev/null
+                  jq -e '.assets | all(.name | contains("darwin-") | not)' before.json > /dev/null
+                  jq -S '[.assets[] | {id, name, size, digest, browser_download_url}] | sort_by(.id)' before.json > preserved.json
+                  gh release upload "v$HAPPY_AGENT_RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
+                    happy-agent-0.4.115-darwin-x64.tar.gz happy-agent-0.4.115-darwin-x64.tar.gz.sha256 \
+                    happy-agent-0.4.115-darwin-arm64.tar.gz happy-agent-0.4.115-darwin-arm64.tar.gz.sha256
+                  gh api "$release" > after.json
+                  jq -S '[.assets[] | select(.name | contains("darwin-") | not) | {id, name, size, digest, browser_download_url}] | sort_by(.id)' after.json > retained.json
+                  cmp preserved.json retained.json
+                  for archive in happy-agent-*.tar.gz; do
+                      digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+                      jq -e --arg name "$archive" --arg digest "sha256:$digest" \
+                        '.assets | any(.name == $name and .digest == $digest)' after.json > /dev/null
+                  done
+                  echo 'Added verified native Mac archives to v0.4.115; existing release assets retained.' >> "$GITHUB_STEP_SUMMARY"
