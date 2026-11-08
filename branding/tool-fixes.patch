@@ -1,0 +1,432 @@
+diff --git a/packages/happy-agent-modules/sources/mcp/LEARNINGS.md b/packages/happy-agent-modules/sources/mcp/LEARNINGS.md
+index c4d3591..ee4bf31 100644
+--- a/packages/happy-agent-modules/sources/mcp/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/mcp/LEARNINGS.md
+@@ -1,5 +1,14 @@
+ # MCP module learnings
+ 
++## Model-facing server names must remain callable
++
++Protocol tool descriptions listed humanized server names while execution required exact
++configuration identifiers, so following the description produced an unknown-server error.
++Descriptions and errors now quote exact identifiers. Protocol calls also resolve an exact,
++unique humanized name to its identifier; an exact identifier wins, and ambiguous display names
++are refused rather than guessed. Registrations, module API names, and permission checks stay
++unchanged.
++
+ ## Model guidance uses the resolved configuration path
+ 
+ The user-wide tools wrote the correct file but described the macOS-only `~/Happy/Config` path
+diff --git a/packages/happy-agent-modules/sources/mcp/createMcpProtocolTools.ts b/packages/happy-agent-modules/sources/mcp/createMcpProtocolTools.ts
+index 0240da0..54b321e 100644
+--- a/packages/happy-agent-modules/sources/mcp/createMcpProtocolTools.ts
++++ b/packages/happy-agent-modules/sources/mcp/createMcpProtocolTools.ts
+@@ -50,10 +50,13 @@ export function createMcpProtocolTools(
+         throw new Error("MCP connected server list contains duplicate names.");
+     }
+     const serverNames = boundedServerNames(names);
+-    const assertServer = (server: string): void => {
+-        if (!names.includes(server)) {
+-            throw new Error(`Unknown MCP server "${server}". Available servers: ${serverNames}.`);
+-        }
++    const resolveServer = (server: string): string => {
++        if (names.includes(server)) return server;
++        const matches = names.filter((name) => humanizeMcpName(name) === server);
++        if (matches.length === 1) return matches[0]!;
++        throw new Error(
++            `${matches.length > 1 ? "Ambiguous" : "Unknown"} MCP server ${quoteVisibleExact(server)}. Use an exact server identifier. Available servers: ${serverNames}.`,
++        );
+     };
+ 
+     return [
+@@ -71,9 +74,8 @@ export function createMcpProtocolTools(
+             requiresAutoOrFullAccess: true,
+             shouldReviewInAutoMode: () => false,
+             execute: async (ctx, input: McpListToolsInput): Promise<McpToolPage> => {
+-                assertServer(input.server);
+                 return await module.listToolPage(ctx, agentId, {
+-                    server: input.server,
++                    server: resolveServer(input.server),
+                     ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+                 });
+             },
+@@ -99,8 +101,10 @@ export function createMcpProtocolTools(
+             // readOnlyHint and all other server annotations are untrusted metadata.
+             shouldReviewInAutoMode: () => true,
+             execute: async (ctx, input: McpCallToolInput) => {
+-                assertServer(input.server);
+-                return await module.callTool(ctx, agentId, input);
++                return await module.callTool(ctx, agentId, {
++                    ...input,
++                    server: resolveServer(input.server),
++                });
+             },
+             isError: isMcpErrorResult,
+             toLLM: (result) => module.formatToolResultForModel(result),
+@@ -119,9 +123,8 @@ export function createMcpProtocolTools(
+             requiresAutoOrFullAccess: true,
+             shouldReviewInAutoMode: () => false,
+             execute: async (ctx, input: McpListResourcesInput): Promise<McpResourcePage> => {
+-                assertServer(input.server);
+                 return await module.listResourcePage(ctx, agentId, {
+-                    server: input.server,
++                    server: resolveServer(input.server),
+                     ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+                 });
+             },
+@@ -144,9 +147,8 @@ export function createMcpProtocolTools(
+                 ctx,
+                 input: McpListResourcesInput,
+             ): Promise<McpResourceTemplatePage> => {
+-                assertServer(input.server);
+                 return await module.listResourceTemplatePage(ctx, agentId, {
+-                    server: input.server,
++                    server: resolveServer(input.server),
+                     ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+                 });
+             },
+@@ -168,8 +170,10 @@ export function createMcpProtocolTools(
+             requiresAutoOrFullAccess: true,
+             shouldReviewInAutoMode: () => false,
+             execute: async (ctx, input): Promise<McpReadResourceResult> => {
+-                assertServer(input.server);
+-                return await module.readResource(ctx, agentId, input);
++                return await module.readResource(ctx, agentId, {
++                    ...input,
++                    server: resolveServer(input.server),
++                });
+             },
+             toLLM: (result) => readResourceToContent(result),
+         }),
+@@ -187,8 +191,10 @@ export function createMcpProtocolTools(
+             requiresAutoOrFullAccess: true,
+             shouldReviewInAutoMode: () => false,
+             execute: async (ctx, input: McpListPromptsInput) => {
+-                assertServer(input.server);
+-                return await module.listPromptPage(ctx, agentId, input);
++                return await module.listPromptPage(ctx, agentId, {
++                    ...input,
++                    server: resolveServer(input.server),
++                });
+             },
+             toLLM: (result) => [{ type: "text", text: module.formatPromptPageForModel(result) }],
+         }),
+@@ -207,8 +213,10 @@ export function createMcpProtocolTools(
+                 `loading prompt ${quoteVisibleExact(humanizeMcpName(name))} from ${quoteVisibleExact(humanizeMcpName(server))}. Access: the MCP server can return instructions from outside Happy Agent’s local sandbox`,
+             shouldReviewInAutoMode: () => true,
+             execute: async (ctx, input: McpGetPromptInput) => {
+-                assertServer(input.server);
+-                return await module.getPrompt(ctx, agentId, input);
++                return await module.getPrompt(ctx, agentId, {
++                    ...input,
++                    server: resolveServer(input.server),
++                });
+             },
+             toLLM: (result) => [
+                 { type: "text", text: boundedMcpJsonStringify(result, 512 * 1024) },
+@@ -253,7 +261,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
+ }
+ 
+ function boundedServerNames(names: readonly string[]): string {
+-    const text = names.map((name) => humanizeMcpName(name)).join(", ");
++    const text = names.map((name) => quoteVisibleExact(name)).join(", ");
+     const maximum = 16_384;
+     return text.length <= maximum
+         ? text
+diff --git a/packages/happy-agent-modules/sources/search/README.md b/packages/happy-agent-modules/sources/search/README.md
+index 33f7a67..3053957 100644
+--- a/packages/happy-agent-modules/sources/search/README.md
++++ b/packages/happy-agent-modules/sources/search/README.md
+@@ -56,6 +56,12 @@ A vendor search is not paginated. Each search returns a bounded `SearchAnswer` (
+ `answer`, `sources`, `durationMs`). The model sees the vendor's answer text first, then a bounded
+ `Sources:` block of one URL per line, opportunistically followed by ` — title` when it fits.
+ 
++An optional vendor with no configured account returns a neutral unavailable notice using the same
++result shape, with no sources and zero search duration. The notice explicitly says no search was
++performed and directs the agent to another configured search or a known URL. A Gemini key missing
++at call time is handled the same way. Real authentication, network and provider failures, invalid
++account selection, and permission refusals remain errors; no fallback request is replayed automatically.
++
+ - **`web_fetch`** — fetches one URL with `{ url, maxCharacters? }` and returns a `FetchResult`.
+   `url` must be a valid `http`/`https` address (max 200 characters after normalization), and
+   credentials in the URL are refused so a fetch cannot carry a secret outward. Where a fetch may
+diff --git a/packages/happy-agent-modules/sources/search/SearchModule.ts b/packages/happy-agent-modules/sources/search/SearchModule.ts
+index 3cbbae3..5bc3fa8 100644
+--- a/packages/happy-agent-modules/sources/search/SearchModule.ts
++++ b/packages/happy-agent-modules/sources/search/SearchModule.ts
+@@ -26,7 +26,7 @@ import { codexWebSearch } from "./impl/codexWebSearch.js";
+ import { geminiWebSearch } from "./impl/geminiWebSearch.js";
+ import { grokWebSearch } from "./impl/grokWebSearch.js";
+ import { grokXSearch } from "./impl/grokXSearch.js";
+-import { resolveSearchRoutes } from "./impl/SearchRoute.js";
++import { resolveSearchRoutes, SearchNotConfiguredError } from "./impl/SearchRoute.js";
+ import type { VendorSearchContext } from "./impl/VendorSearchContext.js";
+ import { fetchWebPage } from "./impl/webFetch/fetchWebPage.js";
+ import { bedrockWebSearchTool } from "./tools/bedrock_web_search.js";
+@@ -116,7 +116,19 @@ export class SearchModule implements AgentModule {
+                 : { blockedDomains: [...request.blockedDomains] }),
+             ...(request.latest === undefined ? {} : { latest: request.latest }),
+         };
+-        const answer = await vendorSearch(ctx, this.#search(currentProviderId), normalized);
++        let answer: SearchAnswer;
++        try {
++            answer = await vendorSearch(ctx, this.#search(currentProviderId), normalized);
++        } catch (error) {
++            if (!(error instanceof SearchNotConfiguredError)) throw error;
++            answer = {
++                provider: normalized.provider,
++                query,
++                answer: `Search unavailable: ${error.message} No search was performed and no sources were retrieved. Use another configured search service or web_fetch for a known URL.`,
++                sources: [],
++                durationMs: 0,
++            };
++        }
+         assertSearchAnswer(answer, normalized);
+         /*
+          * The formatter is part of the module boundary.  An answer whose sources cannot all be
+diff --git a/packages/happy-agent-modules/sources/search/impl/SearchRoute.ts b/packages/happy-agent-modules/sources/search/impl/SearchRoute.ts
+index 5431b50..d135ae5 100644
+--- a/packages/happy-agent-modules/sources/search/impl/SearchRoute.ts
++++ b/packages/happy-agent-modules/sources/search/impl/SearchRoute.ts
+@@ -1,6 +1,9 @@
+ import type { AgentModel, AgentProviders } from "@slopus/happy-agent-base";
+ import type { SessionReasoningEffort } from "@slopus/happy-providers";
+ 
++/** Missing optional configuration is availability information, not a failed search request. */
++export class SearchNotConfiguredError extends Error {}
++
+ /** One configured account and model a bounded vendor search can run on. */
+ export interface SearchRoute {
+     /** Registry ID of the configured provider, as a person named it. */
+@@ -81,7 +84,9 @@ export function selectSearchRoute(
+     requestedProviderId: string | undefined,
+ ): SearchRoute {
+     if (routes.length === 0) {
+-        throw new Error(`No ${vendor} account is configured, so ${vendor} search is unavailable.`);
++        throw new SearchNotConfiguredError(
++            `No ${vendor} account is configured, so ${vendor} search is unavailable.`,
++        );
+     }
+     const available = routes.map((route) => route.providerId).join(", ");
+     const defaultRoute =
+diff --git a/packages/happy-agent-modules/sources/search/impl/geminiWebSearch.ts b/packages/happy-agent-modules/sources/search/impl/geminiWebSearch.ts
+index 2d28a38..819b30f 100644
+--- a/packages/happy-agent-modules/sources/search/impl/geminiWebSearch.ts
++++ b/packages/happy-agent-modules/sources/search/impl/geminiWebSearch.ts
+@@ -2,6 +2,7 @@ import type { SearchAnswer, SearchProviderRequest, SearchSource } from "../Searc
+ import type { Context } from "@steve.kite/stdlib";
+ 
+ import { boundedSources } from "./boundedSources.js";
++import { SearchNotConfiguredError } from "./SearchRoute.js";
+ import { createTimedSignal } from "../../impl/createTimedSignal.js";
+ import type { VendorSearchContext } from "./VendorSearchContext.js";
+ 
+@@ -40,7 +41,7 @@ export async function geminiWebSearch(
+ ): Promise<SearchAnswer> {
+     const apiKey = search.geminiApiKey;
+     if (apiKey === undefined) {
+-        throw new Error(
++        throw new SearchNotConfiguredError(
+             "Gemini search needs a Gemini API key. Set [gemini] api_key in the user happy.toml or GEMINI_API_KEY to use gemini_web_search.",
+         );
+     }
+diff --git a/packages/happy-agent-modules/tests/search/SearchModule.test.ts b/packages/happy-agent-modules/tests/search/SearchModule.test.ts
+index a749962..90e966e 100644
+--- a/packages/happy-agent-modules/tests/search/SearchModule.test.ts
++++ b/packages/happy-agent-modules/tests/search/SearchModule.test.ts
+@@ -97,6 +97,7 @@ async function toolsFor(search: SearchModule, agentScope = scope(AGENT_ID)) {
+ 
+ afterEach(() => {
+     vi.unstubAllEnvs();
++    vi.unstubAllGlobals();
+ });
+ 
+ describe("SearchModule", () => {
+@@ -163,16 +164,62 @@ describe("SearchModule", () => {
+         );
+     });
+ 
+-    it("says which vendor has no configured account instead of searching nowhere", async () => {
+-        const tools = await toolsFor(await module());
++    it("returns a neutral unavailable result when an optional search account is not configured", async () => {
++        const search = await module();
++        const tools = await toolsFor(search);
+         const byName = new Map(tools.map((tool) => [tool.name, tool]));
++        const fetch = vi.fn();
++        vi.stubGlobal("fetch", fetch);
++
++        for (const [name, vendor] of [
++            ["grok_web_search", "Grok"],
++            ["grok_x_search", "Grok"],
++            ["bedrock_web_search", "Bedrock"],
++        ]) {
++            const tool = byName.get(name!)!;
++            const result = (await tool.execute(ctx, { query: "rig" }, undefined as never)) as SearchAnswer;
++            expect(Value.Check(searchAnswerSchema, result)).toBe(true);
++            expect(result.answer).toContain(`No ${vendor} account is configured`);
++            expect(result.answer).toContain("No search was performed");
++            expect(result.answer).toContain("another configured search service");
++            expect(result.sources).toEqual([]);
++            expect(result.durationMs).toBe(0);
++            expect(tool.toLLM!(result)).toEqual([{ type: "text", text: result.answer }]);
++        }
++        expect(fetch).not.toHaveBeenCalled();
++    });
+ 
++    it("handles missing optional accounts and a missing Gemini key consistently for direct callers", async () => {
++        vi.stubEnv("GEMINI_API_KEY", "");
++        const search = new SearchModule(await configWith([]));
++        const fetch = vi.fn();
++        vi.stubGlobal("fetch", fetch);
++
++        for (const provider of ["claude", "codex", "gemini"] as const) {
++            const result = await search.providerSearch(ctx, AGENT_ID, { provider, query: " rig " });
++            expect(result.provider).toBe(provider);
++            expect(result.query).toBe("rig");
++            expect(result.answer).toContain("No search was performed");
++            expect(result.sources).toEqual([]);
++        }
++        expect(fetch).not.toHaveBeenCalled();
++    });
++
++    it("does not disguise configured search authentication and transport failures as unavailable", async () => {
++        vi.stubEnv("GEMINI_API_KEY", "test-key");
++        const search = await module();
++        const fetch = vi.fn().mockResolvedValue(
++            new Response(JSON.stringify({ error: { message: "authentication failed" } }), { status: 401 }),
++        );
++        vi.stubGlobal("fetch", fetch);
+         await expect(
+-            byName.get("grok_web_search")!.execute(ctx, { query: "rig" }, undefined as never),
+-        ).rejects.toThrow("No Grok account is configured");
++            search.providerSearch(ctx, AGENT_ID, { provider: "gemini", query: "rig" }),
++        ).rejects.toThrow("Gemini web search failed (401)");
++        const networkError = new Error("network unavailable");
++        fetch.mockRejectedValue(networkError);
+         await expect(
+-            byName.get("bedrock_web_search")!.execute(ctx, { query: "rig" }, undefined as never),
+-        ).rejects.toThrow("No Bedrock account is configured");
++            search.providerSearch(ctx, AGENT_ID, { provider: "gemini", query: "rig" }),
++        ).rejects.toBe(networkError);
+     });
+ 
+     it("names the account a vendor search was asked for when that account does not exist", async () => {
+@@ -352,6 +399,11 @@ describe("SearchModule", () => {
+             tools
+                 .find((tool) => tool.name === "codex_web_search")!
+                 .execute(ctx, { query: "rig" }, undefined as never),
+-        ).rejects.toThrow("No Codex account is configured");
++        ).resolves.toMatchObject({
++            provider: "codex",
++            answer: expect.stringContaining("No Codex account is configured"),
++            sources: [],
++            durationMs: 0,
++        });
+     });
+ });
+diff --git a/packages/happy-agent-modules/tests/mcp/McpProtocolServerNames.test.ts b/packages/happy-agent-modules/tests/mcp/McpProtocolServerNames.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/happy-agent-modules/tests/mcp/McpProtocolServerNames.test.ts
+@@ -0,0 +1,101 @@
++import { createRootContext } from "@steve.kite/stdlib";
++import { describe, expect, it, vi } from "vitest";
++
++import { createMcpProtocolTools } from "../../sources/mcp/createMcpProtocolTools.js";
++import type { McpModule } from "../../sources/mcp/McpModule.js";
++
++const ctx = createRootContext().named("mcp-server-name-test");
++
++function fixture(names: string[] = ["math_core", "pdrkocum_ai_fetch"]) {
++    const module = {
++        listToolPage: vi.fn().mockResolvedValue({ tools: [] }),
++        callTool: vi.fn().mockResolvedValue({ content: [] }),
++        listResourcePage: vi.fn().mockResolvedValue({ resources: [] }),
++        listResourceTemplatePage: vi.fn().mockResolvedValue({ resourceTemplates: [] }),
++        readResource: vi.fn().mockResolvedValue({ contents: [] }),
++        listPromptPage: vi.fn().mockResolvedValue({ prompts: [] }),
++        getPrompt: vi.fn().mockResolvedValue({ messages: [] }),
++    };
++    const tools = createMcpProtocolTools(
++        module as unknown as McpModule,
++        "agent",
++        names.map((name) => ({ name })),
++    );
++    return { module, tool: (name: string) => tools.find((tool) => tool.name === name)!, tools };
++}
++
++describe("MCP protocol server identities", () => {
++    it("advertises the exact callable identifiers rather than only display names", () => {
++        const { tools } = fixture();
++        for (const tool of tools) {
++            expect(tool.description).toContain('"math_core"');
++            expect(tool.description).toContain('"pdrkocum_ai_fetch"');
++        }
++    });
++
++    it.each([
++        ["list_mcp_tools", "listToolPage", { cursor: "next" }],
++        ["call_mcp_tool", "callTool", { name: "echo", arguments: { text: "hello" } }],
++        ["list_mcp_resources", "listResourcePage", { cursor: "next" }],
++        ["list_mcp_resource_templates", "listResourceTemplatePage", { cursor: "next" }],
++        ["read_mcp_resource", "readResource", { uri: "fixture://math" }],
++        ["list_mcp_prompts", "listPromptPage", { cursor: "next" }],
++        ["get_mcp_prompt", "getPrompt", { name: "hello", arguments: { text: "hello" } }],
++    ] as const)(
++        "resolves a unique display name for %s before calling the module",
++        async (name, method, input) => {
++            const { module, tool } = fixture();
++            await tool(name).execute(ctx, { server: "Math Core", ...input }, undefined as never);
++            expect(module[method]).toHaveBeenCalledWith(ctx, "agent", {
++                server: "math_core",
++                ...input,
++            });
++        },
++    );
++
++    it("resolves the displayed Pdrkocum name without changing its registration", async () => {
++        const { module, tool } = fixture();
++        await tool("list_mcp_tools").execute(
++            ctx,
++            { server: "Pdrkocum Ai Fetch" },
++            undefined as never,
++        );
++        expect(module.listToolPage).toHaveBeenCalledWith(ctx, "agent", {
++            server: "pdrkocum_ai_fetch",
++        });
++    });
++
++    it("gives an exact identifier priority over a matching display name", async () => {
++        const { module, tool } = fixture(["Math Core", "math_core"]);
++        await tool("list_mcp_tools").execute(ctx, { server: "Math Core" }, undefined as never);
++        expect(module.listToolPage).toHaveBeenCalledWith(ctx, "agent", { server: "Math Core" });
++    });
++
++    it("refuses an ambiguous display name while exact identifiers remain callable", async () => {
++        const { module, tool } = fixture(["math_core", "math-core"]);
++        await expect(
++            tool("list_mcp_tools").execute(ctx, { server: "Math Core" }, undefined as never),
++        ).rejects.toThrow("Ambiguous MCP server");
++        expect(module.listToolPage).not.toHaveBeenCalled();
++        await tool("list_mcp_tools").execute(ctx, { server: "math_core" }, undefined as never);
++        expect(module.listToolPage).toHaveBeenCalledWith(ctx, "agent", { server: "math_core" });
++    });
++
++    it("refuses unknown names without guessing and returns exact available identifiers", async () => {
++        const { module, tool } = fixture();
++        await expect(
++            tool("list_mcp_tools").execute(ctx, { server: "Math" }, undefined as never),
++        ).rejects.toThrow('Available servers: "math_core", "pdrkocum_ai_fetch"');
++        expect(module.listToolPage).not.toHaveBeenCalled();
++    });
++
++    it("keeps permission and review boundaries on the real definitions", () => {
++        const { tools } = fixture();
++        for (const tool of tools) {
++            expect(tool.requiresAutoOrFullAccess).toBe(true);
++            expect(tool.shouldReviewInAutoMode?.({} as never, ctx)).toBe(
++                ["call_mcp_tool", "get_mcp_prompt"].includes(tool.name),
++            );
++        }
++    });
++});

@@ -143,6 +143,12 @@ jobs:
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   node cyberfi-overlay/branding/patch-compute-sdk.mjs .
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Verify MCP names, optional searches and narrow command runtime permissions
+              run: |
+                  node --test cyberfi-overlay/branding/command-tool-read-policy.test.mjs
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/skills/CyberFiCommandToolReadPolicy.test.ts --maxWorkers=2
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Build workspace JavaScript
               run: pnpm build
             - name: Verify source named-pipe transports before signing and compiling

@@ -32,6 +32,9 @@ if (process.argv[4] !== '--source-only') {
   assert(!compiled.includes('You are Happy, a calm, friendly voice companion'));
   const policy = readFileSync(join(root, 'packages/happy-agent-modules/dist/compute/ComputeModule.js'), 'utf8');
   for (const token of ['readableDirectories', 'globalSkillsRoot', 'globalSkillDirectories', 'skillsHome', 'homeFromRoot']) assert(policy.includes(token), `Missing compiled skill-read policy: ${token}`);
+  assert(policy.includes('cyberFiCommandToolReadDirectories') && policy.includes('HAPPY_AGENT_COMMAND_TOOL_READ_PATHS'), 'Missing compiled managed command read policy');
+  const commandPolicy = readFileSync(join(root, 'packages/happy-agent-modules/dist/compute/cyberfiCommandToolReadPolicy.js'), 'utf8');
+  for (const token of ['mcp-runtime', 'runtimes', 'realpathSync', 'privateRoot', 'ripgrep-15.2.0']) assert(commandPolicy.includes(token), `Missing compiled command read boundary: ${token}`);
 }
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(here, 'asset-manifest.json')));

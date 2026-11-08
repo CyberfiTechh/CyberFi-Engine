@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { createServer, request as httpRequest } from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep, win32 } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Same public v0 routes and socket identity as pinned HappyAgentClient/localAgentPaths.
 function clientFor(socketPath, token) {
@@ -42,6 +43,11 @@ await writeFile(join(role, 'SKILL.md'), instruction);
 await writeFile(support, 'OWNED_SUPPORT_SENTINEL');
 await mkdir(dirname(unrelated), { recursive: true });
 await writeFile(unrelated, 'UNRELATED_PRIVATE_SENTINEL');
+const mcpConfig = join(root, process.platform === 'darwin' ? 'Happy/Config' : 'happy/config', 'mcp.toml');
+await mkdir(dirname(mcpConfig), { recursive: true });
+const mcpFixture = fileURLToPath(new URL('../../happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs', import.meta.url));
+await writeFile(mcpConfig, `[mcp_servers.math_core]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([mcpFixture, 'owned-native'])}\nstartup_timeout_sec = 15\ntool_timeout_sec = 15\n`);
+
 const auth = randomBytes(24).toString('hex');
 const stages = new Map();
 const readCommand = path => process.platform === 'win32'
@@ -76,7 +82,7 @@ const fixture = createServer(async (request, response) => {
 });
 await new Promise(done => fixture.listen(0, '127.0.0.1', done));
 const environment = { ...process.env };
-for (const name of Object.keys(environment)) if (/TOKEN|SECRET|PASSWORD|API_KEY/i.test(name)) delete environment[name];
+for (const name of Object.keys(environment)) if (/TOKEN|SECRET|PASSWORD|API_KEY/i.test(name) || /^(AWS_|AZURE_|GOOGLE_|GEMINI_|ANTHROPIC_|OPENAI_|GROK_|XAI_|BEDROCK_)/i.test(name)) delete environment[name];
 const daemon = spawn(binary, ['run'], {
     cwd: join(root, 'workspace'), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...environment, HOME: root, USERPROFILE: root, HAPPY_HOME_DIR: happyHome,
@@ -98,11 +104,11 @@ async function wait(work, milliseconds = 60000) {
 }
 const toolsOf = history => history.runs.flatMap(run => run.messages).flatMap(message => message.content).filter(block => block.type === 'tool_call');
 const output = tool => typeof tool.result === 'string' ? tool.result : tool.result?.output ?? JSON.stringify(tool.result);
-async function request(agentId, tool) {
+async function request(agentId, tool, permissionMode = 'read_only') {
     const id = `s${randomUUID().replaceAll('-', '').slice(0, 23)}`;
     await client.sendMessage(agentId, { id, text: 'Isolated native skill check', delivery: 'queue',
         content: [{ type: 'tool_call_request', ...tool }],
-        mode: { effort: 'off', modelId: 'openai/gym', providerId: 'gym', permissionMode: 'read_only', serviceTier: null } });
+        mode: { effort: 'off', modelId: 'openai/gym', providerId: 'gym', permissionMode, serviceTier: null } });
     return await wait(async () => {
         const history = await client.getMessages(agentId, { limit: 100 });
         const run = history.runs.find(run => run.messages.some(message => message.id === id));
@@ -148,9 +154,18 @@ try {
         if (/Process running with session ID \d+/.test(output(file))) return undefined;
         assert(shellCalls.some(tool => output(tool).includes('OWNED_SUPPORT_SENTINEL')), 'Read-only child support read failed: ' + output(file)); return true;
     }, 120000);
+    const catalog = await request(parent, { name: 'list_mcp_tools', arguments: { server: 'Math Core' } }, 'full_access');
+    assert.equal(catalog.status, 'completed'); assert(output(catalog).includes('echo'), 'Native MCP display alias did not resolve');
+    const echo = await request(parent, { name: 'call_mcp_tool', arguments: { server: 'Math Core', name: 'echo', arguments: { text: 'NATIVE_ALIAS_SENTINEL' } } }, 'full_access');
+    assert.equal(echo.status, 'completed'); assert(output(echo).includes('owned-native:NATIVE_ALIAS_SENTINEL'), 'Native MCP alias tool invocation failed');
+    for (const name of ['grok_web_search', 'bedrock_web_search']) {
+        const unavailable = await request(parent, { name, arguments: { query: 'Owned unavailable-account check' } }, 'full_access');
+        assert.equal(unavailable.status, 'completed');
+        assert(output(unavailable).includes('No search was performed'), 'Missing optional account was not reported as unavailable');
+    }
     assert.equal(await readFile(support, 'utf8'), 'OWNED_SUPPORT_SENTINEL');
     assert.equal(await readFile(unrelated, 'utf8'), 'UNRELATED_PRIVATE_SENTINEL');
-    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, paidInference: false }));
+    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, paidInference: false }));
 } catch (error) {
     if (process.platform === 'win32') {
         const paths = [root, join(root, '.agents'), join(root, '.agents', 'skills'), role, support];

@@ -76,10 +76,14 @@ ${animation}`;
 export function apply(platform, directory) {
   const root = resolve(directory);
   if (execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== revision) throw Error('Unexpected engine source revision');
+  const toolFixes = join(here, 'tool-fixes.patch');
+  execFileSync('git', ['-C', root, 'apply', '--check', toolFixes]);
+  execFileSync('git', ['-C', root, 'apply', toolFixes]);
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
   let computeText = replace(readFileSync(computePolicy, 'utf8').replaceAll('\r\n', '\n'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, parse, relative, sep, type PlatformPath } from "node:path";\nimport { realpathSync, statSync } from "node:fs";', computePolicy);
+  computeText = replace(computeText, 'import { realpathSync, statSync } from "node:fs";', 'import { realpathSync, statSync } from "node:fs";\nimport { cyberFiCommandToolReadDirectories } from "./cyberfiCommandToolReadPolicy.js";', computePolicy);
   computeText = replace(computeText,
     `    get hostPolicy(): ComputeHostPolicy {
         const values = this.#config.configuration.values;`,
@@ -97,6 +101,7 @@ export function apply(platform, directory) {
     `            privateDirectories: [this.#config.configuration.paths.agentHome],
             // Installed instructions and their support files stay readable in restricted runs.
             readableDirectories: home === undefined ? [] : [...new Set([
+                ...[
                 this.#config.globalSkillsRoot,
                 ...this.#config.globalSkillDirectories,
                 this.#config.configuration.paths.skillsHome,
@@ -105,8 +110,15 @@ export function apply(platform, directory) {
                 if (directory === undefined || relative(directory, parse(directory).root) === "") return false;
                 const homeFromRoot = relative(directory, home);
                 return homeFromRoot === ".." || homeFromRoot.startsWith(".." + sep) || isAbsolute(homeFromRoot);
-            }))],`, computePolicy);
+            }),
+                ...cyberFiCommandToolReadDirectories(
+                    this.#config.configuration.paths.agentHome,
+                    process.env.HAPPY_AGENT_COMMAND_TOOL_READ_PATHS,
+                ),
+            ])],`, computePolicy);
   changes.push([computePolicy, computeText]);
+  changes.push([join(root, 'packages/happy-agent-modules/sources/compute/cyberfiCommandToolReadPolicy.ts'), readFileSync(join(here, 'CommandToolReadPolicy.ts'), 'utf8')]);
+  changes.push([join(root, 'packages/happy-agent-modules/tests/compute/CyberFiCommandToolReadPolicy.test.ts'), readFileSync(join(here, 'CommandToolReadPolicy.test.ts'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent/scripts/cyberfi-smoke-skills.mjs'), readFileSync(join(here, 'smoke-skills.mjs'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/skills/CyberFiSkillsReadPolicy.test.ts'), readFileSync(join(here, 'SkillsReadPolicy.test.ts'), 'utf8')]);
   const voice = join(root, 'packages/happy-agent-modules/sources/live/impl/livePrompts.ts');
