@@ -147,7 +147,11 @@ jobs:
               run: |
                   node --test cyberfi-overlay/branding/command-tool-read-policy.test.mjs
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/skills/CyberFiCommandToolReadPolicy.test.ts --maxWorkers=2
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Verify human Full access inheritance and queued human restrictions
+              run: |
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/collaboration/CollaborationModule.test.ts tests/subtasks/SubtaskPermissionModes.test.ts -t 'collaborator permission modes|subtask permission modes' --maxWorkers=2
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Build workspace JavaScript
               run: pnpm build
@@ -213,7 +217,8 @@ jobs:
                   node cyberfi-overlay/branding/patch-compute-sdk.mjs . --verify
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   $tray = Get-Item packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-win32-x64.exe
-                  if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne '0.4.117.0') { throw 'Native tray metadata mismatch' }
+                  $expectedFileVersion = ($env:HAPPY_AGENT_RELEASE_VERSION -split '-')[0] + '.0'
+                  if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne $expectedFileVersion -or $tray.VersionInfo.ProductVersion -ne $env:HAPPY_AGENT_RELEASE_VERSION) { throw 'Native tray metadata mismatch' }
             - name: Sign and verify the standalone executable
               if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
               run: ./scripts/sign-windows-files.ps1 -Directory packages/happy-agent/dist/bin

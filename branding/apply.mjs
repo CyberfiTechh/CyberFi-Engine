@@ -74,16 +74,24 @@ enum StatusIcon {
 ${animation}`;
 }
 export function apply(platform, directory) {
+  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.120';
+  if (releaseVersion.trim() !== releaseVersion || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-preview\.(0|[1-9]\d*))?$/.test(releaseVersion) || releaseVersion.split('-')[0].split('.').some(part => Number(part) > 65535)) throw Error('Invalid native engine release version');
+  const assemblyVersion = releaseVersion.split('-')[0] + '.0';
   const root = resolve(directory);
   if (execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== revision) throw Error('Unexpected engine source revision');
   const toolFixes = join(here, 'tool-fixes.patch');
   execFileSync('git', ['-C', root, 'apply', '--check', toolFixes]);
   execFileSync('git', ['-C', root, 'apply', toolFixes]);
+  const fullAccess = join(here, 'full-access-delegation.patch');
+  execFileSync('git', ['-C', root, 'apply', '--check', fullAccess]);
+  execFileSync('git', ['-C', root, 'apply', fullAccess]);
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
   let computeText = replace(readFileSync(computePolicy, 'utf8').replaceAll('\r\n', '\n'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, parse, relative, sep, type PlatformPath } from "node:path";\nimport { realpathSync, statSync } from "node:fs";', computePolicy);
   computeText = replace(computeText, 'import { realpathSync, statSync } from "node:fs";', 'import { realpathSync, statSync } from "node:fs";\nimport { cyberFiCommandToolReadDirectories } from "./cyberfiCommandToolReadPolicy.js";', computePolicy);
+  computeText = replace(computeText, 'import { cyberFiCommandToolReadDirectories } from "./cyberfiCommandToolReadPolicy.js";', 'import { cyberFiCommandToolReadDirectories } from "./cyberfiCommandToolReadPolicy.js";\nimport { cyberFiCommandToolsEnvironment, cyberFiCommandToolsReadiness } from "./cyberfiCommandToolsReady.js";', computePolicy);
+  computeText = replace(computeText, '    #closed = false;', '    #closed = false;\n    #commandToolsReady?: ReturnType<typeof cyberFiCommandToolsReadiness>;', computePolicy);
   computeText = replace(computeText,
     `    get hostPolicy(): ComputeHostPolicy {
         const values = this.#config.configuration.values;`,
@@ -116,8 +124,45 @@ export function apply(platform, directory) {
                     process.env.HAPPY_AGENT_COMMAND_TOOL_READ_PATHS,
                 ),
             ])],`, computePolicy);
+  computeText = replace(computeText, '                this.#guardSessionStarts(agentId, cached);', '                if (here) this.#applyCommandToolsReadiness(cached);\n                this.#guardSessionStarts(agentId, cached);', computePolicy);
+  computeText = replace(computeText, '    /** A process whose spawn crosses an abort boundary is part of that abort, not the next turn. */',
+    `    #applyCommandToolsReadiness(cached: CachedCompute): void {
+        const shell = cached.compute.shell;
+        const originalRun = shell.run;
+        const originalStart = shell.startSession;
+        const ready = this.#commandToolsReady ??= cyberFiCommandToolsReadiness(
+            this.#config.configuration.paths.agentHome, process.env,
+        );
+        const prepared = async (
+            permissions: ComputePermissions,
+            environment: Readonly<Record<string, string | null>> | undefined,
+            signal?: AbortSignal,
+        ) => {
+            const generation = cached.abortGeneration;
+            const paths = await ready(signal,
+                () => !cached.closing && !this.#closed && cached.abortGeneration === generation,
+            );
+            if (paths === undefined) return { permissions };
+            return {
+                permissions: permissions.mode === "full_access" ? permissions : {
+                    ...permissions, allowedReadPaths: [...new Set([...(permissions.allowedReadPaths ?? []), ...paths])],
+                },
+                environment: cyberFiCommandToolsEnvironment(paths, process.env, environment),
+            };
+        };
+        shell.run = async (options) => await originalRun.call(shell, {
+            ...options, ...await prepared(options.permissions, options.environment, options.signal),
+        });
+        shell.startSession = async (options) => await originalStart.call(shell, {
+            ...options, ...await prepared(options.permissions, options.environment),
+        });
+    }
+
+    /** A process whose spawn crosses an abort boundary is part of that abort, not the next turn. */`, computePolicy);
   changes.push([computePolicy, computeText]);
   changes.push([join(root, 'packages/happy-agent-modules/sources/compute/cyberfiCommandToolReadPolicy.ts'), readFileSync(join(here, 'CommandToolReadPolicy.ts'), 'utf8')]);
+  changes.push([join(root, 'packages/happy-agent-modules/sources/compute/cyberfiCommandToolsReady.ts'), readFileSync(join(here, 'CommandToolsReady.ts'), 'utf8')]);
+  changes.push([join(root, 'packages/happy-agent-modules/tests/compute/CyberFiCommandToolsReady.test.ts'), readFileSync(join(here, 'CommandToolsReady.test.ts'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/compute/CyberFiCommandToolReadPolicy.test.ts'), readFileSync(join(here, 'CommandToolReadPolicy.test.ts'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent/scripts/cyberfi-smoke-skills.mjs'), readFileSync(join(here, 'smoke-skills.mjs'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/skills/CyberFiSkillsReadPolicy.test.ts'), readFileSync(join(here, 'SkillsReadPolicy.test.ts'), 'utf8')]);
@@ -129,7 +174,7 @@ export function apply(platform, directory) {
   for (const [name, entries] of Object.entries(platform === 'win32' ? windows : macos)) {
     const path = join(native, platform === 'win32' ? 'windows' : '', name);
     let text = translated(readFileSync(path, 'utf8'), entries, platform === 'win32', path);
-    if (name === 'WindowsTray.cs') text = replace(text, 'using System.Windows.Forms;', 'using System.Windows.Forms;\n[assembly: System.Reflection.AssemblyTitle("CyberFi ajan motoru")]\n[assembly: System.Reflection.AssemblyProduct("CyberFi")]\n[assembly: System.Reflection.AssemblyInformationalVersion("0.4.117-preview.1")]\n[assembly: System.Reflection.AssemblyVersion("0.4.117.0")]\n[assembly: System.Reflection.AssemblyFileVersion("0.4.117.0")]', path);
+    if (name === 'WindowsTray.cs') text = replace(text, 'using System.Windows.Forms;', `using System.Windows.Forms;\n[assembly: System.Reflection.AssemblyTitle("CyberFi ajan motoru")]\n[assembly: System.Reflection.AssemblyProduct("CyberFi")]\n[assembly: System.Reflection.AssemblyInformationalVersion("${releaseVersion}")]\n[assembly: System.Reflection.AssemblyVersion("${assemblyVersion}")]\n[assembly: System.Reflection.AssemblyFileVersion("${assemblyVersion}")]`, path);
     changes.push([path, text]);
   }
   const build = join(root, 'packages/happy-agent/scripts/build-binary.ts');

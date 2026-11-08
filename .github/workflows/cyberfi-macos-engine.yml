@@ -7,11 +7,11 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-macos-engine-0.4.119
+    group: cyberfi-macos-engine-0.4.120
     cancel-in-progress: false
 
 env:
-    HAPPY_AGENT_RELEASE_VERSION: "0.4.119"
+    HAPPY_AGENT_RELEASE_VERSION: "0.4.120"
 
 jobs:
     macos:
@@ -69,7 +69,10 @@ jobs:
             - name: Verify MCP names, optional searches and narrow command runtime permissions
               run: |
                   node --test cyberfi-overlay/branding/command-tool-read-policy.test.mjs
-                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/skills/CyberFiCommandToolReadPolicy.test.ts --maxWorkers=2
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
+            - name: Verify human Full access inheritance and queued human restrictions
+              run: |
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/collaboration/CollaborationModule.test.ts tests/subtasks/SubtaskPermissionModes.test.ts -t 'collaborator permission modes|subtask permission modes' --maxWorkers=2
             - name: Build workspace JavaScript
               run: |
                   pnpm --filter @slopus/happy-agent-supervisor build
@@ -192,12 +195,12 @@ jobs:
                   release="repos/$GITHUB_REPOSITORY/releases/$release_id"
                   gh api "$release" > before.json
                   jq -e '.draft == true and .prerelease == true' before.json > /dev/null
-                  jq -e '.assets | any(.name == "happy-agent-0.4.119-win32-x64.tar.gz")' before.json > /dev/null
+                  jq -e '.assets | any(.name == "happy-agent-0.4.120-win32-x64.tar.gz")' before.json > /dev/null
                   jq -e '.assets | all(.name | contains("darwin-") | not)' before.json > /dev/null
                   jq -S '[.assets[] | {id, name, size, digest, browser_download_url}] | sort_by(.id)' before.json > preserved.json
                   gh release upload "v$HAPPY_AGENT_RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
-                    happy-agent-0.4.119-darwin-x64.tar.gz happy-agent-0.4.119-darwin-x64.tar.gz.sha256 \
-                    happy-agent-0.4.119-darwin-arm64.tar.gz happy-agent-0.4.119-darwin-arm64.tar.gz.sha256
+                    happy-agent-0.4.120-darwin-x64.tar.gz happy-agent-0.4.120-darwin-x64.tar.gz.sha256 \
+                    happy-agent-0.4.120-darwin-arm64.tar.gz happy-agent-0.4.120-darwin-arm64.tar.gz.sha256
                   gh api "$release" > after.json
                   jq -S '[.assets[] | select(.name | contains("darwin-") | not) | {id, name, size, digest, browser_download_url}] | sort_by(.id)' after.json > retained.json
                   cmp preserved.json retained.json
@@ -207,4 +210,4 @@ jobs:
                         '.assets | any(.name == $name and .digest == $digest)' after.json > /dev/null
                   done
                   jq -e '.draft == true and .prerelease == true and (.assets | length == 6)' after.json > /dev/null
-                  echo 'All three native architectures validated in draft v0.4.119; publication and Latest remain held.' >> "$GITHUB_STEP_SUMMARY"
+                  echo 'All three native architectures validated in draft v0.4.120; publication and Latest remain held.' >> "$GITHUB_STEP_SUMMARY"

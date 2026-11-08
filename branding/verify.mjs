@@ -35,6 +35,9 @@ if (process.argv[4] !== '--source-only') {
   assert(policy.includes('cyberFiCommandToolReadDirectories') && policy.includes('HAPPY_AGENT_COMMAND_TOOL_READ_PATHS'), 'Missing compiled managed command read policy');
   const commandPolicy = readFileSync(join(root, 'packages/happy-agent-modules/dist/compute/cyberfiCommandToolReadPolicy.js'), 'utf8');
   for (const token of ['mcp-runtime', 'runtimes', 'realpathSync', 'privateRoot', 'ripgrep-15.2.0']) assert(commandPolicy.includes(token), `Missing compiled command read boundary: ${token}`);
+  const readiness = readFileSync(join(root, 'packages/happy-agent-modules/dist/compute/cyberfiCommandToolsReady.js'), 'utf8');
+  assert(policy.includes('cyberFiCommandToolsReadiness'), 'Missing compiled terminal readiness integration');
+  for (const token of ['command-tools.json', 'generation', 'CYBERFI_COMMAND_TOOLS_STATUS_PATH']) assert(readiness.includes(token), `Missing compiled terminal readiness: ${token}`);
 }
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(here, 'asset-manifest.json')));

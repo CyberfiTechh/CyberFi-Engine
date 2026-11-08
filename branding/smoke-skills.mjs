@@ -26,6 +26,7 @@ function clientFor(socketPath, token) {
         createBot: body => json('POST', 'v0/bots', body),
         sendMessage: (id, body) => json('POST', `v0/agents/${encodeURIComponent(id)}/send`, body),
         getMessages: id => json('GET', `v0/agents/${encodeURIComponent(id)}/messages?limit=100`),
+        getMode: id => json('GET', `v0/agents/${encodeURIComponent(id)}/mode`),
         shutdown: () => json('POST', 'v0/shutdown'),
     };
 }
@@ -50,6 +51,7 @@ await writeFile(mcpConfig, `[mcp_servers.math_core]\ncommand = ${JSON.stringify(
 
 const auth = randomBytes(24).toString('hex');
 const stages = new Map();
+const sessionKinds = new Map();
 const readCommand = path => process.platform === 'win32'
     ? `Get-Content -LiteralPath '${path.replaceAll("'", "''")}' -ErrorAction Stop`
     : `cat '${path.replaceAll("'", "'\\''")}'`;
@@ -59,9 +61,34 @@ const fixture = createServer(async (request, response) => {
         const chunks = []; for await (const chunk of request) chunks.push(chunk);
         const input = JSON.parse(Buffer.concat(chunks).toString());
         const key = input.options?.sessionId;
-        const child = JSON.stringify(input.context?.messages ?? input.messages ?? []).includes('CHILD_SKILL_CHECK');
+        const transcript = JSON.stringify(input.context?.messages ?? input.messages ?? []);
+        if (!sessionKinds.has(key)) sessionKinds.set(key,
+            transcript.includes('FULL_ACCESS_GRANDCHILD_CHECK') ? 'full-grandchild' :
+            transcript.includes('FULL_ACCESS_CHILD_CHECK') ? 'full-child' :
+            transcript.includes('CHILD_SKILL_CHECK') ? 'read-only-child' : 'other');
+        // A parent followup changes an existing child's next tool namespace, not its provider session.
+        if (sessionKinds.get(key) === 'read-only-child' && transcript.includes('EXISTING_CHILD_FULL_CHECK')) {
+            sessionKinds.set(key, 'existing-full-child'); stages.set(key, 0);
+        }
+        const kind = sessionKinds.get(key);
         let content = [{ type: 'text', text: 'Owned smoke complete.' }];
-        if (child && !String(key).endsWith(':title')) {
+        if ((kind === 'full-child' || kind === 'full-grandchild' || kind === 'existing-full-child') && !String(key).endsWith(':title')) {
+            const stage = stages.get(key) ?? 0;
+            const sentinel = kind === 'full-child' ? 'FULL_ACCESS_CHILD_SENTINEL' : kind === 'existing-full-child' ? 'EXISTING_CHILD_FULL_SENTINEL' : 'FULL_ACCESS_GRANDCHILD_SENTINEL';
+            const calls = [
+                ['exec_command', { cmd: process.platform === 'win32' ? `Write-Output '${sentinel}'` : `printf '%s\\n' '${sentinel}'`, yield_time_ms: 30000 }],
+                ['call_mcp_tool', { server: 'Math Core', name: 'echo', arguments: { text: sentinel + '_MCP' } }],
+                ...(kind === 'full-child' ? [['create_agent', { title: 'Owned full grandchild', model: 'openai/gym', provider: 'gym', effort: 'off', read_only: true, text: 'FULL_ACCESS_GRANDCHILD_CHECK Run only the owned shell and MCP checks.' }]] : []),
+            ];
+            if (stage < calls.length) {
+                stages.set(key, stage + 1);
+                content = [{ type: 'tool_call', callId: `owned-full-${stage}`, name: calls[stage][0], arguments: calls[stage][1] }];
+            } else {
+                const signals = [...transcript.matchAll(/Process (?:running with session ID (\d+)|exited with code -?\d+)/g)];
+                const pending = signals.at(-1)?.[1];
+                if (pending) content = [{ type: 'tool_call', callId: `owned-poll-${randomUUID()}`, name: 'write_stdin', arguments: { session_id: Number(pending), chars: '', yield_time_ms: 30000 } }];
+            }
+        } else if (kind === 'read-only-child' && !String(key).endsWith(':title')) {
             const stage = stages.get(key) ?? 0;
             const calls = [
                 ['read_skill', { name: 'owned-review' }],
@@ -154,6 +181,34 @@ try {
         if (/Process running with session ID \d+/.test(output(file))) return undefined;
         assert(shellCalls.some(tool => output(tool).includes('OWNED_SUPPORT_SENTINEL')), 'Read-only child support read failed: ' + output(file)); return true;
     }, 120000);
+    const fullCreated = await request(parent, { name: 'create_agent', arguments: { title: 'Owned full child', model: 'openai/gym', provider: 'gym', effort: 'off', read_only: true, text: 'FULL_ACCESS_CHILD_CHECK Run only owned shell, MCP and nested inheritance checks.' } }, 'full_access');
+    assert.equal(fullCreated.status, 'completed');
+    const fullChildId = /Created collaborator ([a-z0-9]+)/.exec(output(fullCreated))?.[1]; assert(fullChildId, 'Missing full child ID');
+    async function fullProof(id, sentinel, nested) {
+        return await wait(async () => {
+            if ((await client.getMode(id)).mode?.permissionMode !== 'full_access') return undefined;
+            const calls = toolsOf(await client.getMessages(id));
+            const shellCalls = calls.filter(tool => ['exec_command', 'write_stdin'].includes(tool.name) && tool.status !== 'running');
+            const shell = shellCalls.find(tool => output(tool).includes(sentinel));
+            const mcp = calls.find(tool => tool.name === 'call_mcp_tool' && tool.status !== 'running');
+            if (!shell || !mcp) return undefined;
+            assert.equal(shell.status, 'completed'); assert(output(shell).includes(sentinel));
+            if (!shellCalls.some(tool => output(tool).includes('Process exited with code 0'))) return undefined;
+            assert.equal(mcp.status, 'completed'); assert(output(mcp).includes('owned-native:' + sentinel + '_MCP'));
+            if (!nested) return true;
+            const created = calls.find(tool => tool.name === 'create_agent' && tool.status !== 'running');
+            if (!created) return undefined;
+            assert.equal(created.status, 'completed');
+            const grandchild = /Created collaborator ([a-z0-9]+)/.exec(output(created))?.[1];
+            assert(grandchild, 'Missing full grandchild ID'); return grandchild;
+        }, 120000);
+    }
+    const fullGrandchildId = await fullProof(fullChildId, 'FULL_ACCESS_CHILD_SENTINEL', true);
+    await fullProof(fullGrandchildId, 'FULL_ACCESS_GRANDCHILD_SENTINEL', false);
+    assert.equal((await client.getMode(childId)).mode?.permissionMode, 'read_only');
+    const followed = await request(parent, { name: 'send_agent_message', arguments: { toAgentId: childId, text: 'EXISTING_CHILD_FULL_CHECK Run only the owned native shell and MCP checks.' } }, 'full_access');
+    assert.equal(followed.status, 'completed');
+    await fullProof(childId, 'EXISTING_CHILD_FULL_SENTINEL', false);
     const catalog = await request(parent, { name: 'list_mcp_tools', arguments: { server: 'Math Core' } }, 'full_access');
     assert.equal(catalog.status, 'completed'); assert(output(catalog).includes('echo'), 'Native MCP display alias did not resolve');
     const echo = await request(parent, { name: 'call_mcp_tool', arguments: { server: 'Math Core', name: 'echo', arguments: { text: 'NATIVE_ALIAS_SENTINEL' } } }, 'full_access');
@@ -165,7 +220,7 @@ try {
     }
     assert.equal(await readFile(support, 'utf8'), 'OWNED_SUPPORT_SENTINEL');
     assert.equal(await readFile(unrelated, 'utf8'), 'UNRELATED_PRIVATE_SENTINEL');
-    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, paidInference: false }));
+    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, fullAccessChildAndGrandchild: true, nativeFullAccessChildShellAndMcp: true, existingChildFullShellAndMcp: true, paidInference: false }));
 } catch (error) {
     if (process.platform === 'win32') {
         const paths = [root, join(root, '.agents'), join(root, '.agents', 'skills'), role, support];

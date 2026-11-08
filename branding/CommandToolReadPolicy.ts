@@ -2,12 +2,9 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
-/** Grant only the desktop installer's two managed command-runtime directories. */
-export function cyberFiCommandToolReadDirectories(
-    agentHome: string,
-    raw: string | undefined,
-): string[] {
-    if (raw === undefined || raw.length > 16_384 || !isAbsolute(agentHome)) return [];
+/** Fixed leaves shared by installation readiness and restricted-command reads. */
+export function cyberFiCommandToolExpectedPaths(agentHome: string): string[] {
+    if (!isAbsolute(agentHome)) return [];
     const target = process.platform + "-" + process.arch;
     const rgDirectories: Record<string, string> = {
         "win32-x64": "ripgrep-15.2.0-x86_64-pc-windows-msvc",
@@ -16,6 +13,18 @@ export function cyberFiCommandToolReadDirectories(
     };
     const rgDirectory = rgDirectories[target];
     if (rgDirectory === undefined) return [];
+    const base = join(dirname(dirname(agentHome)), "mcp-runtime", "runtimes");
+    return [join(base, "python-" + target, "python"), join(base, "rg-" + target, rgDirectory)];
+}
+
+/** Grant only the desktop installer's two managed command-runtime directories. */
+export function cyberFiCommandToolReadDirectories(
+    agentHome: string,
+    raw: string | undefined,
+): string[] {
+    if (raw === undefined || raw.length > 16_384) return [];
+    const expected = cyberFiCommandToolExpectedPaths(agentHome);
+    if (expected.length !== 2) return [];
     try {
         const paths: unknown = JSON.parse(raw);
         if (
@@ -33,10 +42,6 @@ export function cyberFiCommandToolReadDirectories(
         const lexicalBase = join(lexicalRoot, "mcp-runtime", "runtimes");
         // Reject redirected runtime ancestors as well as redirected leaf directories.
         if (relative(base, realpathSync(lexicalBase)) !== "") return [];
-        const expected = [
-            join(lexicalBase, "python-" + target, "python"),
-            join(lexicalBase, "rg-" + target, rgDirectory),
-        ];
         const requested = expected.filter((value) =>
             paths.some((path) => relative(value, path) === ""),
         );

@@ -1,0 +1,1123 @@
+diff --git a/packages/happy-agent-modules/sources/api/ApiModule.ts b/packages/happy-agent-modules/sources/api/ApiModule.ts
+index dc0afbbb4ce0e9716ff7135c4b33a3ead3698142..bf02feacba0653f615dd4844d65273c79a9fe1bb 100644
+--- a/packages/happy-agent-modules/sources/api/ApiModule.ts
++++ b/packages/happy-agent-modules/sources/api/ApiModule.ts
+@@ -251,6 +251,7 @@ import {
+     type HistoryRunState,
+ } from "../history/index.js";
+ import { USER_MESSAGE_ORIGIN_METADATA } from "../impl/messageOrigin.js";
++import { queueHumanPermissionSelection } from "../impl/pendingHumanPermission.js";
+ import { mutationIdOf } from "../impl/mutationEcho.js";
+ import { RunMutationOwners } from "./RunMutationOwners.js";
+ import { decodeRequestProfile, requestProfilesForAgent } from "../impl/requestProfile.js";
+@@ -5587,10 +5588,18 @@ export class ApiModule implements AgentModule {
+                 await ctx.inTx(async (txCtx) => {
+                     await this.#assertUserControlledAgent(txCtx, agentId);
+                     await this.#history.queuePending(txCtx, pending);
+-                    if (delivery === "steer") {
+-                        await agents.steer(txCtx, agentId, { role: "user", content }, options);
+-                    } else {
+-                        await agents.send(txCtx, agentId, { role: "user", content }, options);
++                    const acceptance =
++                        delivery === "steer"
++                            ? await agents.steer(txCtx, agentId, { role: "user", content }, options)
++                            : await agents.send(txCtx, agentId, { role: "user", content }, options);
++                    if (acceptance.accepted === "created") {
++                        await queueHumanPermissionSelection(
++                            txCtx,
++                            agents,
++                            agentId,
++                            id,
++                            body.mode.permissionMode,
++                        );
+                     }
+                     afterCommit(txCtx, (postCommitCtx) =>
+                         this.#scheduling?.interruptWaits(postCommitCtx, agentId),
+diff --git a/packages/happy-agent-modules/sources/collaboration/CollaborationModule.ts b/packages/happy-agent-modules/sources/collaboration/CollaborationModule.ts
+index dab795e3c783a749347c9429c2ad6cda191516a0..df3116733c6c69a73067e2332fcc92e50a205e95 100644
+--- a/packages/happy-agent-modules/sources/collaboration/CollaborationModule.ts
++++ b/packages/happy-agent-modules/sources/collaboration/CollaborationModule.ts
+@@ -35,10 +35,15 @@ import {
+     narrowerPermissionMode,
+ } from "../impl/delegatedPermissionMode.js";
+ import {
++    isUserOriginMetadata,
+     senderAgentExplanationFromTitle,
+     senderAgentExplanationMetadata,
+     senderAgentIdMetadata,
+ } from "../impl/messageOrigin.js";
++import {
++    PENDING_HUMAN_PERMISSION_KEY,
++    pendingHumanPermission,
++} from "../impl/pendingHumanPermission.js";
+ import { mutationIdMetadata, mutationIdOf } from "../impl/mutationEcho.js";
+ import {
+     collaborationAgentIdSchema,
+@@ -86,9 +91,10 @@ import { sendMessageTool } from "./tools/send_message.js";
+  * that wants to keep working while a collaborator thinks just keeps working.
+  *
+  * What a collaborator runs on is settled on the message that starts it. Only its creator may switch
+- * its model later, on a message that carries the new choice, and no later message carries a
+- * permission mode of the sender's. Its permission mode is its creator's own unless `read_only`
+- * hands it less; `full_mode` asks for Full access, which only a creator in Full access has.
++ * its model later, on a message that carries the new choice. A trusted human Full access grant
++ * also follows later messages down its own descendant tree, unless the recipient has a newer
++ * restrictive human selection. The person's Full access grant is inherited; otherwise
++ * `read_only` can narrow the creator's mode and `full_mode` cannot widen it.
+  */
+ export class CollaborationModule implements AgentModule {
+     readonly name = "collaboration";
+@@ -434,6 +440,7 @@ export class CollaborationModule implements AgentModule {
+         messageId: string,
+         switchTo?: CollaborationModelChoice,
+         creator?: CollaborationCreator,
++        creatorPermissionMode: AgentPermissionMode = DEFAULT_AGENT_PERMISSION_MODE,
+     ): Promise<void> {
+         this.#assert(collaborationAgentIdSchema, actingAgentId, "acting agent ID");
+         this.#assert(collaborationSendInputSchema, input, "send message");
+@@ -459,9 +466,58 @@ export class CollaborationModule implements AgentModule {
+             selection,
+             await this.#history.runMutationId(ctx, actingAgentId),
+             input.explanation,
++            creatorPermissionMode,
+         );
+     }
+ 
++    /** Only a persistent human grant can widen a later descendant delivery; tool-review loans cannot. */
++    async #followupHumanGrant(
++        ctx: Context,
++        sender: string,
++        recipient: string,
++        persistentMode: AgentPermissionMode,
++    ): Promise<"full_access" | undefined> {
++        if (persistentMode !== "full_access" || sender === recipient) return undefined;
++        const agents = this.#requireAgents();
++        const lineage: string[] = [];
++        const seen = new Set<string>();
++        let id: string | null = recipient;
++        while (id !== null && id !== sender && !seen.has(id)) {
++            seen.add(id);
++            lineage.push(id);
++            id = await agents.parentOf(ctx, id);
++        }
++        if (id !== sender) return undefined;
++        // A full child may itself steer a grandchild under the same originating human grant.
++        let grant: HumanPermissionGrant | undefined;
++        seen.clear();
++        id = sender;
++        while (id !== null && !seen.has(id)) {
++            seen.add(id);
++            const sourceMetadata = (await agents.config(ctx, id))?.metadata;
++            if (pendingHumanPermission(sourceMetadata) !== undefined) return undefined;
++            const candidate = humanPermissionGrant(sourceMetadata);
++            if (
++                candidate !== undefined &&
++                (grant === undefined ||
++                    candidate.at > grant.at ||
++                    (candidate.at === grant.at && candidate.mode !== "full_access"))
++            )
++                grant = candidate;
++            id = await agents.parentOf(ctx, id);
++        }
++        if (grant?.mode !== "full_access") return undefined;
++        for (const descendant of lineage) {
++            const descendantMetadata = (await agents.config(ctx, descendant))?.metadata;
++            if (pendingHumanPermission(descendantMetadata) !== undefined) return undefined;
++            const local = humanPermissionGrant(descendantMetadata);
++            // Equal timestamps deliberately keep a person's restrictive choice.
++            if (local !== undefined && local.mode !== "full_access" && local.at >= grant.at)
++                return undefined;
++        }
++        return "full_access";
++    }
++
+     /**
+      * What a creator's message switches its direct collaborator or subtask to. The choice is
+      * checked against the same offered models as `create_agent`. The permission mode stays the
+@@ -640,6 +696,32 @@ export class CollaborationModule implements AgentModule {
+             scope: AgentModuleScope,
+             accepted: AgentBaseAcceptedMessage,
+         ): Promise<void> => {
++            if (
++                isUserOriginMetadata(accepted.metadata) &&
++                Value.Check(messageModeSchema, accepted.metadata?.mode)
++            ) {
++                // Base's durable inbox accepts each ID once and commits this hook atomically.
++                // An immediate hook retry cannot renew the last recorded grant either.
++                const previous = humanPermissionGrant(
++                    (await this.#requireAgents().config(ctx, scope.agent.id))?.metadata,
++                );
++                if (previous?.messageId !== accepted.id) {
++                    await this.#requireAgents().updateMetadata(ctx, scope.agent.id, {
++                        [HUMAN_PERMISSION_KEY]: {
++                            // Base folds a whole pending batch before invoking each hook. Only
++                            // this trusted entry's own composer mode is authorization evidence.
++                            mode: accepted.metadata.mode.permissionMode,
++                            messageId: accepted.id,
++                            at: Date.now(),
++                        },
++                        ...(pendingHumanPermission(
++                            (await this.#requireAgents().config(ctx, scope.agent.id))?.metadata,
++                        )?.messageId === accepted.id
++                            ? { [PENDING_HUMAN_PERMISSION_KEY]: null }
++                            : {}),
++                    });
++                }
++            }
+             if (accepted.metadata?.[AGENT_OPTIONS_METADATA_KEY] === undefined) return;
+             const pending = await scope.kv.read(ctx, AGENT_OPTIONS_PENDING_KEY);
+             if (!Value.Check(agentOptionsPendingSchema, pending) || pending.id !== accepted.id) {
+@@ -712,6 +794,7 @@ export class CollaborationModule implements AgentModule {
+                     scope.agent.id,
+                     await this.#reachesAcrossWorkspaces(ctx, scope.agent.id),
+                     creator,
++                    scope.agent.permissionMode,
+                 ),
+                 interruptAgentTool(this, scope.agent.id),
+                 archiveAgentTool(this, scope.agent.id),
+@@ -816,11 +899,21 @@ export class CollaborationModule implements AgentModule {
+         selection: OpeningSelection | undefined,
+         mutationId: string | undefined,
+         explanation?: string,
++        senderPersistentMode?: AgentPermissionMode,
+     ): Promise<void> {
+         const agents = this.#requireAgents();
+         const run = async (work: (workCtx: Context) => Promise<void>): Promise<void> =>
+             agentDatabase(ctx) === undefined ? await work(ctx) : await ctx.inTx(work);
+         await run(async (txCtx) => {
++            const inheritedPermissionMode =
++                senderPersistentMode === undefined
++                    ? undefined
++                    : await this.#followupHumanGrant(
++                          txCtx,
++                          fromAgentId,
++                          toAgentId,
++                          senderPersistentMode,
++                      );
+             const target = await agents.config(txCtx, toAgentId);
+             if (isArchived(target?.metadata)) {
+                 throw new Error("The agent is archived and cannot receive messages.");
+@@ -849,7 +942,7 @@ export class CollaborationModule implements AgentModule {
+             // composes on top of the coordinator's choice instead of the daemon defaults. The
+             // permission mode is the one creation settled or the recipient already had, sent
+             // explicitly so the recorded mode is what the collaborator actually runs with.
+-            const mode =
++            const selectedMode =
+                 selection === undefined
+                     ? fallback?.mode
+                     : {
+@@ -859,6 +952,26 @@ export class CollaborationModule implements AgentModule {
+                           providerId: selection.provider,
+                           serviceTier: selection.serviceTier ?? null,
+                       };
++            const previousMode = target?.metadata?.["lastMode"];
++            const recordedMode =
++                selectedMode ??
++                (Value.Check(messageModeSchema, previousMode) ? previousMode : undefined);
++            const pendingRestriction = pendingHumanPermission(target?.metadata);
++            const permissionOverride =
++                pendingRestriction === undefined
++                    ? inheritedPermissionMode
++                    : narrowerPermissionMode(
++                          selectedMode?.permissionMode ??
++                              recordedMode?.permissionMode ??
++                              "full_access",
++                          pendingRestriction.mode,
++                      );
++            const mode =
++                permissionOverride === undefined
++                    ? selectedMode
++                    : recordedMode === undefined
++                      ? undefined
++                      : { ...recordedMode, permissionMode: permissionOverride };
+             const options = {
+                 id: messageId,
+                 metadata: {
+@@ -881,6 +994,7 @@ export class CollaborationModule implements AgentModule {
+                           // message without a tier does.
+                           serviceTier: selection.serviceTier ?? null,
+                       }),
++                ...(permissionOverride === undefined ? {} : { permissionMode: permissionOverride }),
+             };
+             const accepted =
+                 delivery === "steer"
+@@ -889,7 +1003,7 @@ export class CollaborationModule implements AgentModule {
+             if (accepted.id !== messageId) {
+                 throw new Error("Agent Base did not preserve the requested message ID.");
+             }
+-            if (mode !== undefined || hasInitialMode) {
++            if (accepted.accepted === "created" && (mode !== undefined || hasInitialMode)) {
+                 await agents.updateMetadata(txCtx, toAgentId, {
+                     ...(mode === undefined ? {} : { lastMode: mode }),
+                     initialMode: null,
+@@ -1298,3 +1412,26 @@ function belongsToWorkflow(metadata: AgentMetadata | undefined): boolean {
+     const workflow = metadata?.["workflow"];
+     return workflow !== null && typeof workflow === "object" && !Array.isArray(workflow);
+ }
++
++/** Private authorization provenance; message metadata supplied by agents is never copied here. */
++const HUMAN_PERMISSION_KEY = "collaborationHumanPermission";
++interface HumanPermissionGrant {
++    readonly mode: AgentPermissionMode;
++    readonly messageId: string;
++    readonly at: number;
++}
++function humanPermissionGrant(
++    metadata: AgentMetadata | undefined,
++): HumanPermissionGrant | undefined {
++    const value = metadata?.[HUMAN_PERMISSION_KEY];
++    if (typeof value !== "object" || value === null) return undefined;
++    const record = value as Record<string, unknown>;
++    if (
++        !["auto", "read_only", "workspace_write", "full_access"].includes(String(record.mode)) ||
++        typeof record.messageId !== "string" ||
++        typeof record.at !== "number" ||
++        !Number.isFinite(record.at)
++    )
++        return undefined;
++    return record as unknown as HumanPermissionGrant;
++}
+diff --git a/packages/happy-agent-modules/sources/collaboration/LEARNINGS.md b/packages/happy-agent-modules/sources/collaboration/LEARNINGS.md
+index ce68ae30535f79826f5d8b96f7c606bcbd32b004..fc3aa7bbac78205706508e69af8c45c5a31fb204 100644
+--- a/packages/happy-agent-modules/sources/collaboration/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/collaboration/LEARNINGS.md
+@@ -169,9 +169,28 @@ for.
+ Every collaborator started in Auto, whatever its creator ran in, because the opening task always
+ sent the product default. A Read only or Workspace write agent could hand work to an Auto child,
+ and a Full access agent's children were sandboxed. The opening task now carries the creator's
+-persistent mode. `read_only: true` is the one way to hand on less, and `full_mode: true` asks for Full
+-access, accepted only from a creator already in Full access; both together are refused. The
++persistent mode. A person's Full access grant must remain Full access in all descendants, even
++when the model requests `read_only: true`. In other modes, `read_only` narrows access and
++`full_mode` cannot widen it; conflicting flags are still refused. The
+ creator's mode is read from the module scope the tool is built with, never from the call's
+ context, because an Auto review may lend that call Full access for one action. The check throws
+ before the spawn presentation or the child exists. A first message to a conversation that never
+ ran starts it no wider than the sender's mode, since that message is the one that sets it.
++
++A human can grant Full access after a child has already started Read only. Accepted user-origin
++messages record that persistent selection in private collaboration metadata; agent and exported
++guest messages cannot write grants. A later send_agent_message carries Full access only down
++the sender's own descendant tree, checked in the delivery transaction. A newer or equal-time
++restrictive human selection on any descendant wins. Model/provider choices remain untouched,
++and Base applies the permission-only steer to the next tool namespace, including MCP tools.
++Already running processes keep their original context. Base's durable inbox deduplicates
++accepted message IDs atomically with the grant write; the last ID also guards immediate hook
++retries. This uses no separate per-message authorization ledger.
++
++Grant provenance uses each accepted human entry's validated metadata.mode, never the module
++scope: Base may fold several queued entries before notifying hooks, so the final batch mode
++cannot authorize earlier entries. Missing or invalid per-entry modes leave the previous human
++grant unchanged. The real human API enqueue transaction records one pending restriction per
++agent; every collaboration selection, including a model switch, is capped until acceptance. A
++later human Full enqueue clears that cap but does not create a grant before acceptance. Agent
++and guest messages cannot create or clear it. Existing-ID delivery retries never rewrite lastMode.
+diff --git a/packages/happy-agent-modules/sources/collaboration/tools/create_agent.ts b/packages/happy-agent-modules/sources/collaboration/tools/create_agent.ts
+index f4bf511f40dfa6608f44385a6dd50ba0940ac42d..f73cdb283f502882374d541a9b311137c0a30302 100644
+--- a/packages/happy-agent-modules/sources/collaboration/tools/create_agent.ts
++++ b/packages/happy-agent-modules/sources/collaboration/tools/create_agent.ts
+@@ -14,7 +14,7 @@ import {
+ 
+ /**
+  * Create a collaborator and hand it its opening task. `creatorPermissionMode` is the creating
+- * agent's persistent mode, which the collaborator runs in unless the call sets read_only or full_mode.
++ * agent's persistent mode. Full access is inherited even when a model requests read_only.
+  */
+ export function createAgentTool(
+     collaboration: CollaborationModule,
+@@ -81,7 +81,7 @@ function createAgentDescription(
+         "The collaborator works on its own. This call returns as soon as the task is delivered, and anything the collaborator has to say arrives later as a message — nothing here waits for it.",
+         `One root agent tree may contain at most ${maxCollaborators} ordinary collaborators. Reuse one with send_agent_message after reaching the limit, or archive one that can no longer work (for example, its provider fails) with archive_agent to free its place. The maximum depth is ${maxCollaborationDepth} agents including the root. Subtasks belong to the tree but count toward neither limit; collaborators they create do count.`,
+         "Choose an exact model and effort; harness and provider default to yours when they serve the model. Switch them later only when needed, with model fields on send_agent_message.",
+-        "The collaborator runs in your current permission mode. Set read_only to run it in Read only. Set full_mode to run it in Full access, which is allowed only while you are in Full access yourself.",
++        "The collaborator inherits your persistent permission mode. The person's Full access grant stays Full access for every descendant, even if read_only is requested. In other modes, read_only narrows access; full_mode cannot widen your own mode.",
+         "",
+         options,
+         "",
+diff --git a/packages/happy-agent-modules/sources/collaboration/tools/send_message.ts b/packages/happy-agent-modules/sources/collaboration/tools/send_message.ts
+index fed47c37345a2b264f62c958d568ff1d4062df56..8ff4aff5576320b1a210a254b977b16546960652 100644
+--- a/packages/happy-agent-modules/sources/collaboration/tools/send_message.ts
++++ b/packages/happy-agent-modules/sources/collaboration/tools/send_message.ts
+@@ -1,5 +1,9 @@
+ import { Type } from "@sinclair/typebox";
+-import { defineAgentTool } from "@slopus/happy-agent-base";
++import {
++    defineAgentTool,
++    DEFAULT_AGENT_PERMISSION_MODE,
++    type AgentPermissionMode,
++} from "@slopus/happy-agent-base";
+ 
+ import type { CollaborationModule } from "../CollaborationModule.js";
+ import {
+@@ -19,6 +23,7 @@ export function sendMessageTool(
+     actingAgentId: string,
+     crossWorkspace: boolean,
+     creator: CollaborationCreator,
++    creatorPermissionMode: AgentPermissionMode = DEFAULT_AGENT_PERMISSION_MODE,
+ ) {
+     return defineAgentTool({
+         name: "send_agent_message",
+@@ -57,6 +62,7 @@ export function sendMessageTool(
+                 call.id,
+                 switchOf(input),
+                 creator,
++                creatorPermissionMode,
+             );
+         },
+         toLLM: () => [
+diff --git a/packages/happy-agent-modules/sources/impl/delegatedPermissionMode.ts b/packages/happy-agent-modules/sources/impl/delegatedPermissionMode.ts
+index 52f1a67240785350ee1c14e573d68d0b3e8433f3..e2035907fad699536e635df83e2ab8ce308760de 100644
+--- a/packages/happy-agent-modules/sources/impl/delegatedPermissionMode.ts
++++ b/packages/happy-agent-modules/sources/impl/delegatedPermissionMode.ts
+@@ -7,8 +7,9 @@ import { Type } from "@sinclair/typebox";
+  * An agent that creates another, or speaks first to a conversation that has never run, decides
+  * what that conversation may touch. Without a bound, delegation is a way out of the mode a person
+  * chose: a Read only agent could create a Full access collaborator and have it do the writing. So
+- * an agent-created agent runs in its creator's own mode. `read_only` is the one way to hand on
+- * less, and `full_mode` asks for Full access, which only a creator already in Full access may do; any
++ * an agent-created agent runs in its creator's own mode. The person's Full access grant stays
++ * Full access throughout delegation; model flags cannot silently narrow it. In other modes,
++ * `read_only` may hand on less, and `full_mode` requires a creator already in Full access; any
+  * other request is refused rather than quietly adjusted, so the model learns it cannot have it.
+  *
+  * The creator's mode is its persistent one. An Auto review may lend one action Full access, and
+@@ -29,7 +30,7 @@ export const delegatedPermissionFlagSchemas = {
+     read_only: Type.Optional(
+         Type.Boolean({
+             description:
+-                "Run the new agent in Read only. Omit both read_only and full_mode to use your own current permission mode.",
++                "Run the new agent in Read only unless the person granted your current agent Full access, which all descendants inherit. Omit both flags to use your own current permission mode.",
+         }),
+     ),
+     full_mode: Type.Optional(
+@@ -55,9 +56,8 @@ export function narrowerPermissionMode(
+ }
+ 
+ /**
+- * The mode an agent-created agent runs in: Read only when asked, Full access when asked by a
+- * creator in Full access, and otherwise its creator's own. Anything else throws before anything is
+- * created.
++ * The person's persistent Full access grant wins over model narrowing. Other creators may hand
++ * on Read only but can never widen their own mode. Invalid requests fail before creation.
+  */
+ export function delegatedPermissionMode(
+     creatorMode: AgentPermissionMode,
+@@ -66,14 +66,12 @@ export function delegatedPermissionMode(
+     if (flags.read_only === true && flags.full_mode === true) {
+         throw new Error("Set read_only or full_mode, not both.");
+     }
++    if (creatorMode === "full_access") return "full_access";
+     if (flags.read_only === true) return "read_only";
+     if (flags.full_mode === true) {
+-        if (creatorMode !== "full_access") {
+-            throw new Error(
+-                `full_mode is allowed only while you are in Full access yourself, and you are in ${agentPermissionModeLabel(creatorMode)}. Omit it to give the new agent your own permission mode, or set read_only to give it less.`,
+-            );
+-        }
+-        return "full_access";
++        throw new Error(
++            `full_mode is allowed only while you are in Full access yourself, and you are in ${agentPermissionModeLabel(creatorMode)}. Omit it to give the new agent your own permission mode, or set read_only to give it less.`,
++        );
+     }
+     return creatorMode;
+ }
+diff --git a/packages/happy-agent-modules/sources/subtasks/LEARNINGS.md b/packages/happy-agent-modules/sources/subtasks/LEARNINGS.md
+index 451bb3ca3a2444830c972e58d55b42420d236eb0..b03c07ebcd10c82d4bb5a8d8809b2dfa9dd3d330 100644
+--- a/packages/happy-agent-modules/sources/subtasks/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/subtasks/LEARNINGS.md
+@@ -131,8 +131,10 @@ the calling module writes the one message its coordinator should see.
+ ## A subtask runs in its coordinator's permission mode
+ 
+ Subtasks always started in Auto. `create_subtask` now settles the mode from the coordinator's
+-persistent mode, with the same `read_only` and `full_mode` rules as `create_agent`, when the tool runs,
+-and records it with the durable start: the start runs later on a context that names no agent, so
++persistent mode, with the same `read_only` and `full_mode` rules as `create_agent`, when the tool runs.
++The person's Full access grant remains Full access even when a model requests Read only; a
++restricted coordinator can still narrow but never widen its mode. The mode is recorded with the
++durable start: the start runs later on a context that names no agent, so
+ it cannot read the coordinator's mode itself. A start recorded before modes were kept uses the
+ product default. Module-owned subtasks (Voice) and exported-bot conversations keep
+ their own modes. A person may still pick any mode in a subtask's own conversation.
+diff --git a/packages/happy-agent-modules/sources/subtasks/SubtasksModule.ts b/packages/happy-agent-modules/sources/subtasks/SubtasksModule.ts
+index 14dcf2d1ea23ff9eb54c8bed643d858bb87daad3..95858c76c17602d71639f733eeff32ea568e6999 100644
+--- a/packages/happy-agent-modules/sources/subtasks/SubtasksModule.ts
++++ b/packages/happy-agent-modules/sources/subtasks/SubtasksModule.ts
+@@ -277,8 +277,8 @@ export class SubtasksModule implements AgentModule {
+      * Create a subtask and send its opening task. `unreported` is for a calling module that tells
+      * the coordinator about the subtask's work itself, so its replies are not reported again.
+      * `creatorPermissionMode` is the coordinator's persistent mode when an agent asks: the subtask
+-     * runs in it unless the input sets `read_only`, or `full_mode`, which requires the coordinator to
+-     * be in Full access. A module creating a subtask of its own omits it and gets the product
++     * inherits Full access even when a model sets `read_only`; other modes can be narrowed but
++     * never widened by those flags. A module creating a subtask of its own omits it and gets the product
+      * default.
+      */
+     async create(
+diff --git a/packages/happy-agent-modules/sources/subtasks/tools/create_subtask.ts b/packages/happy-agent-modules/sources/subtasks/tools/create_subtask.ts
+index 2b82c77d4e946a794d1e838e98c3aaec12b9fd9c..dee8526a52d09b2e5f85a2940fac8fbf778242e2 100644
+--- a/packages/happy-agent-modules/sources/subtasks/tools/create_subtask.ts
++++ b/packages/happy-agent-modules/sources/subtasks/tools/create_subtask.ts
+@@ -7,8 +7,8 @@ import type { CollaborationCreator } from "../../collaboration/index.js";
+ import type { SubtasksModule } from "../SubtasksModule.js";
+ 
+ /**
+- * `creatorPermissionMode` is the coordinator's persistent mode, which the subtask runs in unless
+- * the call sets read_only or full_mode.
++ * `creatorPermissionMode` is the coordinator's persistent mode. Full access is inherited even when a model
++ * requests read_only.
+  */
+ export function createSubtaskTool(
+     subtasks: SubtasksModule,
+@@ -29,7 +29,7 @@ export function createSubtaskTool(
+             "Reserve subtasks for substantial, distinct workstreams, such as changes across projects; handle small steps inline. Usually create second-level subtasks only on explicit user request. Honor explicit subtask requests; use create_agent for internal research.",
+             "Sidebar title: prefer 2–3 words; 4 at most, as a last resort. Put details in text.",
+             "Omit workspace to share your filesystem, or supply workspace with projectId and a short name for a new workspace. Work starts after setup.",
+-            "The subtask runs in your current permission mode. Set read_only to run it in Read only. Set full_mode to run it in Full access, which is allowed only while you are in Full access yourself.",
++            "The subtask inherits your persistent permission mode. The person's Full access grant stays Full access for every descendant, even if read_only is requested. In other modes, read_only narrows access; full_mode cannot widen your own mode.",
+             "Returns the agent ID without waiting. Coordinate via send_agent_message and archive direct subtasks with archive_subtask. Users can message or archive them. There is no wait tool.",
+             "Keep delegated work in the subtask. Ask its agent through send_agent_message for progress, findings, diffs, verification, or follow-up changes. Do not directly inspect or modify its files or run commands in its workspace. Direct access to another workspace often requires elevated permissions and review by the reviewer model; talking to its agent avoids unnecessary permission reviews.",
+             `Choose a model and effort; harness and provider default to yours when they serve the model.\n\n${options}\n\nCall agent_options for the current list.`,
+diff --git a/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts b/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
+index 03b59e4922124e86e6ededf2380c4031fcb582aa..df6b0388e26282502370f0f2328cf4fe89ae213d 100644
+--- a/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
++++ b/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
+@@ -1,4 +1,7 @@
+ import {
++    AgentBase,
++    agentPermissionMode,
++    defineAgentTool,
+     withAgentConfig,
+     withAgentContext,
+     withAgentPermissionMode,
+@@ -11,6 +14,11 @@ import {
+     type AgentSystemRef,
+ } from "@slopus/happy-agent-base";
+ import { Value } from "@sinclair/typebox/value";
++import { Type } from "@sinclair/typebox";
++import { providersOf, textTurn, user } from "../support/fixtures.js";
++import { InMemoryPersistence } from "../support/InMemoryPersistence.js";
++import { ScriptedProvider } from "../support/ScriptedProvider.js";
++import { queueHumanPermissionSelection } from "../../sources/impl/pendingHumanPermission.js";
+ import { parseHappyUrl } from "@slopus/happy-agent-client";
+ import { createRootContext, type Context } from "@steve.kite/stdlib";
+ import { mkdtemp, writeFile } from "node:fs/promises";
+@@ -2228,12 +2236,529 @@ describe("collaborator permission modes", () => {
+         });
+     });
+ 
+-    it.each(PERMISSION_MODES)("lets a %s creator hand a collaborator Read only", async (mode) => {
+-        const { collection, create, ctx } = await createToolIn(mode);
++    it.each(["read_only", "workspace_write", "auto"] as const)(
++        "lets a %s creator hand a collaborator Read only",
++        async (mode) => {
++            const { collection, create, ctx } = await createToolIn(mode);
++
++            await create.execute(ctx, { ...TASK, read_only: true }, toolCall("child"));
++
++            expect(collection.delivered[0]!.options.permissionMode).toBe("read_only");
++        },
++    );
+ 
++    it("preserves a person's Full access grant through child and grandchild model narrowing", async () => {
++        const { collection, create, ctx, hooks } = await createToolIn("full_access");
+         await create.execute(ctx, { ...TASK, read_only: true }, toolCall("child"));
++        const mode = collection.delivered[0]!.options.permissionMode;
++        expect(mode).toBe("full_access");
++        expect(collection.configs.get("child")?.metadata?.["lastMode"]).toMatchObject({
++            permissionMode: mode,
++        });
++        const tools = await hooks.tools!(ctx, {
++            agent: { id: "child", provider: "codex", permissionMode: mode },
++        } as never);
++        await tools
++            .find((tool) => tool.name === "create_agent")!
++            .execute(ctx, { ...TASK, read_only: true }, toolCall("grandchild"));
++        expect(collection.delivered.at(-1)!.options.permissionMode).toBe("full_access");
++    });
++
++    /** Genuine composer acceptance, using the same persistent scope as Agent Base. */
++    async function acceptHuman(
++        hooks: AgentModuleHooks,
++        ctx: Context,
++        agentId: string,
++        mode: AgentPermissionMode,
++        id: string,
++        origin = "user",
++    ) {
++        await hooks.messageAcceptedTransact!(
++            ctx,
++            {
++                agent: { id: agentId, permissionMode: mode },
++                kv: memoryKV(),
++            } as never,
++            {
++                id,
++                metadata: {
++                    messageOrigin: origin,
++                    mode: {
++                        modelId: "gpt-5.6-sol",
++                        providerId: "codex",
++                        effort: "high",
++                        permissionMode: mode,
++                        serviceTier: null,
++                    },
++                },
++                message: { role: "user", content: [] },
++            } as never,
++        );
++    }
++
++    it("steers an existing Read only descendant under a later human Full access grant without switching its model", async () => {
++        const { collection, create, ctx, hooks } = await createToolIn("auto");
++        await create.execute(ctx, { ...TASK, read_only: true }, toolCall("oldchild"));
++        const previous = collection.configs.get("oldchild")!.metadata!["lastMode"];
++        await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
++        const senderTools = await hooks.tools!(ctx, {
++            agent: { id: "parent", provider: "codex", permissionMode: "full_access" },
++        } as never);
++        await senderTools
++            .find((tool) => tool.name === "send_agent_message")!
++            .execute(ctx, { toAgentId: "oldchild", text: "Continue" }, toolCall("followup"));
++        expect(collection.steered.at(-1)!.options).toMatchObject({
++            permissionMode: "full_access",
++            metadata: { mode: { ...(previous as object), permissionMode: "full_access" } },
++        });
++        expect(collection.steered.at(-1)!.options.model).toBeUndefined();
++        const tools = await hooks.tools!(ctx, {
++            agent: { id: "oldchild", provider: "codex", permissionMode: "full_access" },
++        } as never);
++        await tools
++            .find((tool) => tool.name === "create_agent")!
++            .execute(ctx, { ...TASK, read_only: true }, toolCall("latergrandchild"));
++        expect(collection.delivered.at(-1)!.options.permissionMode).toBe("full_access");
++    });
++
++    it("keeps a later explicit recipient human Read only selection, including equal timestamps", async () => {
++        const { create, ctx, hooks, module, collection } = await createToolIn("auto");
++        await create.execute(ctx, { ...TASK, read_only: true }, toolCall("oldchild"));
++        const timestamp = vi.spyOn(Date, "now").mockReturnValue(1234);
++        try {
++            await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
++            await acceptHuman(hooks, ctx, "oldchild", "read_only", "human-restrict");
++        } finally {
++            timestamp.mockRestore();
++        }
++        await module.sendMessage(
++            ctx,
++            "parent",
++            { toAgentId: "oldchild", text: "Continue" },
++            "followup",
++            undefined,
++            CREATOR,
++            "full_access",
++        );
++        expect(collection.steered.at(-1)!.options.permissionMode).toBeUndefined();
++        expect(collection.configs.get("oldchild")!.metadata!["lastMode"]).toMatchObject({
++            permissionMode: "read_only",
++        });
++    });
++
++    it.each(["agent", "guest", "missing"])(
++        "never treats %s-origin full metadata as a human followup grant",
++        async (origin) => {
++            const { create, ctx, hooks, module, collection } = await createToolIn("auto");
++            await create.execute(ctx, { ...TASK, read_only: true }, toolCall("oldchild"));
++            await acceptHuman(hooks, ctx, "parent", "full_access", "forged", origin);
++            await module.sendMessage(
++                ctx,
++                "parent",
++                { toAgentId: "oldchild", text: "Continue" },
++                "followup",
++                undefined,
++                CREATOR,
++                "full_access",
++            );
++            expect(collection.steered.at(-1)!.options.permissionMode).toBeUndefined();
++            expect(
++                collection.configs.get("parent")?.metadata?.["collaborationHumanPermission"],
++            ).toBeUndefined();
++        },
++    );
++
++    it("cannot promote a descendant from an Auto tool loan or an unrelated recipient", async () => {
++        const { create, ctx, hooks, module, collection } = await createToolIn("auto");
++        await create.execute(ctx, { ...TASK, read_only: true }, toolCall("oldchild"));
++        await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
++        await module.sendMessage(
++            withAgentPermissionMode(ctx, "full_access"),
++            "parent",
++            { toAgentId: "oldchild", text: "Continue" },
++            "loan",
++            undefined,
++            CREATOR,
++            "auto",
++        );
++        expect(collection.steered.at(-1)!.options.permissionMode).toBeUndefined();
++        collection.seed("stranger", null);
++        await module.sendMessage(
++            ctx,
++            "parent",
++            { toAgentId: "stranger", text: "Continue" },
++            "unrelated",
++            undefined,
++            CREATOR,
++            "full_access",
++        );
++        expect(collection.steered.at(-1)!.options.permissionMode).toBeUndefined();
++    });
++
++    it("does not renew an accepted human grant on immediate hook replay", async () => {
++        const { ctx, hooks, collection } = await createToolIn("full_access");
++        await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
++        const first = collection.configs.get("parent")!.metadata!["collaborationHumanPermission"];
++        await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
++        expect(collection.configs.get("parent")!.metadata!["collaborationHumanPermission"]).toEqual(
++            first,
++        );
++    });
++
++    it("does not widen a legacy grandchild across a pending human restriction on its intermediate ancestor", async () => {
++        const { collection, create, ctx, hooks, module } = await createToolIn("full_access");
++        await create.execute(ctx, TASK, toolCall("child"));
++        await acceptHuman(hooks, ctx, "parent", "full_access", "humanfull");
++        const childMode = collection.configs.get("child")!.metadata!["lastMode"] as object;
++        collection.seed("grandchild", "child", {
++            metadata: { lastMode: { ...childMode, permissionMode: "read_only" } },
++        });
++        await queueHumanPermissionSelection(
++            ctx,
++            collection.asRef(),
++            "child",
++            "pendingrestriction",
++            "read_only",
++        );
++        expect(
++            collection.configs.get("child")!.metadata!["collaborationHumanPermission"],
++        ).toBeUndefined();
++        // This root-to-grandchild route needs cross-workspace messaging, unlike direct-child delivery.
++        await module.sendMessage(
++            ctx,
++            "parent",
++            { toAgentId: "grandchild", text: "Continue" },
++            "crossfollowup",
++            undefined,
++            CREATOR,
++            "full_access",
++        );
++        expect(collection.steered.at(-1)!.options.permissionMode).toBeUndefined();
++        expect(collection.configs.get("grandchild")!.metadata!["lastMode"]).toMatchObject({
++            permissionMode: "read_only",
++        });
++    });
++
++    it.each([false, true])(
++        "keeps the actual next Base tool Read only when a human restriction is pending beside a parent followup (model switch %s)",
++        async (switchModel) => {
++            const { collection, create, ctx, hooks, module } = await createToolIn("full_access");
++            await create.execute(ctx, TASK, toolCall("oldchild"));
++            await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
++            const seen: string[] = [];
++            const provider = new ScriptedProvider([
++                textTurn("first"),
++                [
++                    { type: "toolcall_start", callId: "probe", name: "probe" },
++                    { type: "toolcall_end", callId: "probe", arguments: "{}" },
++                    { type: "done", state: "tool_call", tokens: { input: 1, output: 1 } },
++                ],
++                textTurn("done"),
++                [
++                    { type: "toolcall_start", callId: "fullprobe", name: "probe" },
++                    { type: "toolcall_end", callId: "fullprobe", arguments: "{}" },
++                    { type: "done", state: "tool_call", tokens: { input: 1, output: 1 } },
++                ],
++                textTurn("full done"),
++                [
++                    { type: "toolcall_start", callId: "followprobe", name: "probe" },
++                    { type: "toolcall_end", callId: "followprobe", arguments: "{}" },
++                    { type: "done", state: "tool_call", tokens: { input: 1, output: 1 } },
++                ],
++                textTurn("followup done"),
++            ]);
++            const providerRegistry = providersOf(provider);
++            providerRegistry.add("codex", provider, "gym");
++            let queued = false;
++            let agent: AgentBase;
++            const originalSteer = collection.steer.bind(collection);
++            vi.spyOn(collection, "steer").mockImplementation(
++                async (toolCtx, id, message, options) => {
++                    await originalSteer(toolCtx, id, message, options);
++                    return await agent.steer(ctx, user(message.content[0]!.text), options as never);
++                },
++            );
++            agent = await AgentBase.create(ctx, {
++                id: "oldchild",
++                provider: "scripted",
++                providers: providerRegistry,
++                persistence: new InMemoryPersistence(),
++                permissionMode: "full_access",
++                steeringMode: "all",
++                initialState: {
++                    tools: [
++                        defineAgentTool({
++                            name: "probe",
++                            returnType: Type.Object({}),
++                            shouldReviewInAutoMode: () => false,
++                            execute: async (toolCtx) => {
++                                seen.push(agentPermissionMode(toolCtx));
++                                return {};
++                            },
++                            toLLM: () => [],
++                        }),
++                    ],
++                },
++                hooks: {
++                    onEvent: async (_ctx, event) => {
++                        if (event.type !== "text_delta" || queued) return;
++                        queued = true;
++                        // Same transaction admission helper as the actual human API. Full is never granted here.
++                        await queueHumanPermissionSelection(
++                            ctx,
++                            collection.asRef(),
++                            "oldchild",
++                            "humanrestrict",
++                            "read_only",
++                        );
++                        await agent.steer(ctx, user("Human Read only"), {
++                            id: "humanrestrict",
++                            permissionMode: "read_only",
++                            metadata: {
++                                messageOrigin: "user",
++                                mode: {
++                                    modelId: "gpt-5.6-sol",
++                                    providerId: "codex",
++                                    effort: "high",
++                                    permissionMode: "read_only",
++                                    serviceTier: null,
++                                },
++                            },
++                        });
++                        await module.sendMessage(
++                            ctx,
++                            "parent",
++                            { toAgentId: "oldchild", text: "Continue" },
++                            "parentfollowup",
++                            switchModel ? { model: TASK.model, effort: TASK.effort } : undefined,
++                            CREATOR,
++                            "full_access",
++                        );
++                    },
++                    messageAcceptedTransact: async (hookCtx, accepted) =>
++                        await hooks.messageAcceptedTransact!(
++                            hookCtx,
++                            {
++                                agent: {
++                                    id: "oldchild",
++                                    permissionMode: agentPermissionMode(hookCtx),
++                                },
++                                kv: memoryKV(),
++                            } as never,
++                            accepted,
++                        ),
++                },
++            });
++            try {
++                await agent.send(ctx, user("go"));
++                await agent.waitForIdle();
++                expect(seen).toEqual(["read_only"]);
++                expect(
++                    collection.configs.get("oldchild")!.metadata!["collaborationHumanPermission"],
++                ).toMatchObject({ mode: "read_only", messageId: "humanrestrict" });
++                expect(collection.steered.at(-1)!.options.permissionMode).toBe("read_only");
++                await queueHumanPermissionSelection(
++                    ctx,
++                    collection.asRef(),
++                    "oldchild",
++                    "humanfull",
++                    "full_access",
++                );
++                // Clearing the pending cap does not itself change the accepted human grant.
++                expect(
++                    collection.configs.get("oldchild")!.metadata!["collaborationHumanPermission"],
++                ).toMatchObject({ mode: "read_only" });
++                await agent.steer(ctx, user("Human Full access"), {
++                    id: "humanfull",
++                    permissionMode: "full_access",
++                    metadata: {
++                        messageOrigin: "user",
++                        mode: {
++                            modelId: "gpt-5.6-sol",
++                            providerId: "codex",
++                            effort: "high",
++                            permissionMode: "full_access",
++                            serviceTier: null,
++                        },
++                    },
++                });
++                await agent.waitForIdle();
++                expect(seen).toEqual(["read_only", "full_access"]);
++                await module.sendMessage(
++                    ctx,
++                    "parent",
++                    { toAgentId: "oldchild", text: "Future followup" },
++                    "futurefollowup",
++                    undefined,
++                    CREATOR,
++                    "full_access",
++                );
++                await agent.waitForIdle();
++                expect(seen).toEqual(["read_only", "full_access", "full_access"]);
++                expect(collection.steered.at(-1)!.options.permissionMode).toBe("full_access");
++            } finally {
++                await agent.close();
++            }
++        },
++    );
++
++    it("binds trusted human grants to per-entry metadata instead of the final actual Base batch scope", async () => {
++        const { collection, ctx, hooks } = await createToolIn("full_access");
++        const provider = new ScriptedProvider([textTurn("first"), textTurn("second")]);
++        let queued = false;
++        let agent: AgentBase;
++        const scopes: string[] = [];
++        agent = await AgentBase.create(ctx, {
++            id: "parent",
++            provider: "scripted",
++            providers: providersOf(provider),
++            persistence: new InMemoryPersistence(),
++            steeringMode: "all",
++            hooks: {
++                onEvent: async (_ctx, event) => {
++                    if (event.type !== "text_delta" || queued) return;
++                    queued = true;
++                    await agent.steer(ctx, user("Human restriction"), {
++                        id: "humanrestrict",
++                        permissionMode: "read_only",
++                        metadata: {
++                            messageOrigin: "user",
++                            mode: {
++                                modelId: "gpt-5.6-sol",
++                                providerId: "codex",
++                                effort: "high",
++                                permissionMode: "read_only",
++                                serviceTier: null,
++                            },
++                        },
++                    });
++                    await agent.steer(ctx, user("Internal full option"), {
++                        id: "internalfull",
++                        permissionMode: "full_access",
++                        metadata: { messageOrigin: "agent" },
++                    });
++                },
++                messageAcceptedTransact: async (hookCtx, accepted) => {
++                    if (accepted.id === "humanrestrict") scopes.push(agentPermissionMode(hookCtx));
++                    await hooks.messageAcceptedTransact!(
++                        hookCtx,
++                        {
++                            agent: { id: "parent", permissionMode: agentPermissionMode(hookCtx) },
++                            kv: memoryKV(),
++                        } as never,
++                        accepted,
++                    );
++                },
++            },
++        });
++        try {
++            await agent.send(ctx, user("go"));
++            await agent.waitForIdle();
++            expect(scopes).toEqual(["full_access"]); // Proves Base's actual final-batch scope differs.
++            expect(
++                collection.configs.get("parent")!.metadata!["collaborationHumanPermission"],
++            ).toMatchObject({ mode: "read_only" });
++        } finally {
++            await agent.close();
++        }
++    });
++
++    it.each([undefined, { permissionMode: "full_access" }])(
++        "ignores missing or invalid trusted per-entry mode without changing an earlier human grant",
++        async (mode) => {
++            const { ctx, hooks, collection } = await createToolIn("full_access");
++            await acceptHuman(hooks, ctx, "parent", "full_access", "good");
++            const previous =
++                collection.configs.get("parent")!.metadata!["collaborationHumanPermission"];
++            await hooks.messageAcceptedTransact!(
++                ctx,
++                { agent: { id: "parent", permissionMode: "full_access" }, kv: memoryKV() } as never,
++                { id: "invalid", metadata: { messageOrigin: "user", mode } } as never,
++            );
++            expect(
++                collection.configs.get("parent")!.metadata!["collaborationHumanPermission"],
++            ).toEqual(previous);
++        },
++    );
++
++    it("clears a pending restrictive cap only on a later real human Full enqueue, without granting Full before acceptance", async () => {
++        const { ctx, hooks, collection } = await createToolIn("full_access");
++        await queueHumanPermissionSelection(
++            ctx,
++            collection.asRef(),
++            "parent",
++            "restrict",
++            "read_only",
++        );
++        for (const origin of ["guest", "agent"])
++            await acceptHuman(hooks, ctx, "parent", "full_access", origin, origin);
++        expect(
++            collection.configs.get("parent")!.metadata!["collaborationPendingHumanPermission"],
++        ).toMatchObject({ mode: "read_only" });
++        await queueHumanPermissionSelection(
++            ctx,
++            collection.asRef(),
++            "parent",
++            "laterfull",
++            "full_access",
++        );
++        expect(
++            collection.configs.get("parent")!.metadata!["collaborationPendingHumanPermission"],
++        ).toBeNull();
++        expect(
++            collection.configs.get("parent")!.metadata!["collaborationHumanPermission"],
++        ).toBeUndefined();
++    });
++
++    it("does not overwrite a later child human restriction when an old creation delivery is replayed", async () => {
++        const { ctx, create, collection } = await createToolIn("full_access");
++        await create.execute(ctx, TASK, toolCall("child"));
++        const lastMode = collection.configs.get("child")!.metadata!["lastMode"] as object;
++        await collection.updateMetadata(ctx, "child", {
++            lastMode: { ...lastMode, permissionMode: "read_only" },
++        });
++        vi.spyOn(collection, "steer").mockResolvedValue({
++            id: "child",
++            delivery: "steer",
++            accepted: "existing",
++        });
++        vi.spyOn(collection, "send").mockResolvedValue({
++            id: "child",
++            delivery: "send",
++            accepted: "existing",
++        });
++        await create.execute(ctx, TASK, toolCall("child"));
++        expect(collection.configs.get("child")!.metadata!["lastMode"]).toMatchObject({
++            permissionMode: "read_only",
++        });
++    });
+ 
+-        expect(collection.delivered[0]!.options.permissionMode).toBe("read_only");
++    it("does not rewrite child selections when an old model-switch followup ID already exists", async () => {
++        const { ctx, create, collection, module } = await createToolIn("full_access");
++        await create.execute(ctx, TASK, toolCall("child"));
++        const lastMode = collection.configs.get("child")!.metadata!["lastMode"] as object;
++        await collection.updateMetadata(ctx, "child", {
++            lastMode: { ...lastMode, permissionMode: "read_only" },
++        });
++        vi.spyOn(collection, "steer").mockResolvedValue({
++            id: "oldfollowup",
++            delivery: "steer",
++            accepted: "existing",
++        });
++        const updates = vi.spyOn(collection, "updateMetadata");
++        await module.sendMessage(
++            ctx,
++            "parent",
++            { toAgentId: "child", text: "Continue" },
++            "oldfollowup",
++            { model: TASK.model, effort: TASK.effort },
++            CREATOR,
++            "full_access",
++        );
++        expect(updates).not.toHaveBeenCalled();
++        expect(collection.configs.get("child")!.metadata!["lastMode"]).toMatchObject({
++            permissionMode: "read_only",
++        });
+     });
+ 
+     it("lets a Full access creator ask for Full access", async () => {
+diff --git a/packages/happy-agent-modules/tests/subtasks/SubtaskPermissionModes.test.ts b/packages/happy-agent-modules/tests/subtasks/SubtaskPermissionModes.test.ts
+index dfd059267deac41be6f15a3879f6c5472b6e3817..e169930afa113f998a8db15c4f8b8cb7d9a8a4a4 100644
+--- a/packages/happy-agent-modules/tests/subtasks/SubtaskPermissionModes.test.ts
++++ b/packages/happy-agent-modules/tests/subtasks/SubtaskPermissionModes.test.ts
+@@ -117,19 +117,40 @@ describe("subtask permission modes", () => {
+         },
+     );
+ 
+-    it.each(PERMISSION_MODES)("lets a %s coordinator hand a subtask Read only", async (mode) => {
+-        const { ctx, createTool, call, startMode, start, collaboration } = fixture();
++    it.each(["read_only", "workspace_write", "auto"] as const)(
++        "lets a %s coordinator hand a subtask Read only",
++        async (mode) => {
++            const { ctx, createTool, call, startMode, start, collaboration } = fixture();
+ 
+-        await (await createTool(mode)).execute(ctx, { ...input, read_only: true }, call("child"));
+-        expect(startMode("child")).toBe("read_only");
++            await (
++                await createTool(mode)
++            ).execute(ctx, { ...input, read_only: true }, call("child"));
++            expect(startMode("child")).toBe("read_only");
++
++            await start("child");
++            expect(collaboration.createAgent).toHaveBeenCalledWith(
++                expect.anything(),
++                "botagent",
++                expect.not.objectContaining({ read_only: true }),
++                "child",
++                { creatorPermissionMode: "read_only" },
++            );
++        },
++    );
+ 
++    it("keeps the person's Full access grant in a read_only-requested subtask's durable start", async () => {
++        const { ctx, createTool, call, startMode, start, collaboration } = fixture();
++        await (
++            await createTool("full_access")
++        ).execute(ctx, { ...input, read_only: true }, call("child"));
++        expect(startMode("child")).toBe("full_access");
+         await start("child");
+         expect(collaboration.createAgent).toHaveBeenCalledWith(
+             expect.anything(),
+             "botagent",
+             expect.not.objectContaining({ read_only: true }),
+             "child",
+-            { creatorPermissionMode: "read_only" },
++            { creatorPermissionMode: "full_access" },
+         );
+     });
+ 
+diff --git a/packages/happy-agent-modules/sources/impl/pendingHumanPermission.ts b/packages/happy-agent-modules/sources/impl/pendingHumanPermission.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..96c14ac322b62854ff63820ad9e7bba3a0e90910
+--- /dev/null
++++ b/packages/happy-agent-modules/sources/impl/pendingHumanPermission.ts
+@@ -0,0 +1,31 @@
++import type { AgentMetadata, AgentPermissionMode, AgentSystemRef } from "@slopus/happy-agent-base";
++import type { Context } from "@steve.kite/stdlib";
++
++/** Private, bounded restriction admission record; only the actual human API enqueue writes it. */
++export const PENDING_HUMAN_PERMISSION_KEY = "collaborationPendingHumanPermission";
++export function pendingHumanPermission(
++    metadata: AgentMetadata | undefined,
++): { mode: AgentPermissionMode; messageId: string } | undefined {
++    const value = metadata?.[PENDING_HUMAN_PERMISSION_KEY];
++    if (typeof value !== "object" || value === null) return undefined;
++    const record = value as Record<string, unknown>;
++    if (
++        !["read_only", "workspace_write", "auto"].includes(String(record.mode)) ||
++        typeof record.messageId !== "string"
++    )
++        return undefined;
++    return record as unknown as { mode: AgentPermissionMode; messageId: string };
++}
++
++/** Called in the real human-send transaction, never by agents or exported guests. Full only clears a cap; it grants nothing before acceptance. */
++export async function queueHumanPermissionSelection(
++    ctx: Context,
++    agents: AgentSystemRef,
++    agentId: string,
++    messageId: string,
++    mode: AgentPermissionMode,
++): Promise<void> {
++    await agents.updateMetadata(ctx, agentId, {
++        [PENDING_HUMAN_PERMISSION_KEY]: mode === "full_access" ? null : { mode, messageId },
++    });
++}

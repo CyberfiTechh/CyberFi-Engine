@@ -7,7 +7,7 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-windows-engine-0.4.119
+    group: cyberfi-windows-engine-0.4.120
     cancel-in-progress: false
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
             contents: read
             id-token: write
         with:
-            version: "0.4.119"
+            version: "0.4.120"
 
     publish:
         if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
@@ -37,10 +37,10 @@ jobs:
               run: |
                   set -euo pipefail
                   cd release-assets
-                  sha256sum -c happy-agent-0.4.119-win32-x64.tar.gz.sha256
+                  sha256sum -c happy-agent-0.4.120-win32-x64.tar.gz.sha256
                   gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > release-catalog.json
-                  jq -e '[.[][] | select(.tag_name == "v0.4.119")] | length == 0' release-catalog.json > /dev/null
-                  gh release create v0.4.119 --repo "$GITHUB_REPOSITORY" \
-                    --draft --prerelease --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.119" \
-                    --notes $'## Düzeltmeler\n- MCP teknik kimlikleri ve benzersiz görünen adları doğru eşleşir; çakışan adlar reddedilir.\n- Hesabı tanımlı olmayan arama servisleri hata yerine açık bir kullanılamıyor bilgisi döndürür; gerçek bağlantı ve izin hataları korunur.\n- Masaüstünün yönetilen Python ve ripgrep araçları kısıtlı ajanlarda yalnız kendi çalışma klasörlerinden salt okunur kullanılabilir.\n- Mevcut beceriler, özel dosya sınırları, Türkçe ses yönergeleri ve CyberFi simgesi korunur.\n\nKaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Üç yerel mimari doğrulaması tamamlanana kadar taslak tutulur. Mac paketleri ad hoc imzalıdır; Apple noter onayı yoktur.' \
-                    happy-agent-0.4.119-win32-x64.tar.gz happy-agent-0.4.119-win32-x64.tar.gz.sha256
+                  jq -e '[.[][] | select(.tag_name == "v0.4.120")] | length == 0' release-catalog.json > /dev/null
+                  gh release create v0.4.120 --repo "$GITHUB_REPOSITORY" \
+                    --draft --prerelease --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.120" \
+                    --notes $'## Düzeltmeler\n- İnsanın Tam erişim seçimi alt ajanlara ve MCP çağrılarına aktarılır; sonraki insan kısıtlamaları korunur.\n- Terminal komutları yönetilen araçların hazırlanmasını bekler; mevcut motor yeni Python ve arama yollarını kullanır.\n- MCP teknik kimlikleri ve benzersiz görünen adları doğru eşleşir; çakışan adlar reddedilir.\n- Hesabı tanımlı olmayan arama servisleri hata yerine açık bir kullanılamıyor bilgisi döndürür; gerçek bağlantı ve izin hataları korunur.\n- Masaüstünün yönetilen Python ve ripgrep araçları kısıtlı ajanlarda yalnız kendi çalışma klasörlerinden salt okunur kullanılabilir.\n- Mevcut beceriler, özel dosya sınırları, Türkçe ses yönergeleri ve CyberFi simgesi korunur.\n\nKaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Üç yerel mimari doğrulaması tamamlanana kadar taslak tutulur. Mac paketleri ad hoc imzalıdır; Apple noter onayı yoktur.' \
+                    happy-agent-0.4.120-win32-x64.tar.gz happy-agent-0.4.120-win32-x64.tar.gz.sha256
