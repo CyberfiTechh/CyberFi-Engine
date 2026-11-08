@@ -136,7 +136,13 @@ jobs:
                   path: cyberfi-overlay
                   persist-credentials: false
             - name: Apply CyberFi tray and voice defaults before compiling JavaScript
-              run: ./cyberfi-overlay/windows/Markala-Windows-Tepsisi.ps1 -EngineSource .
+              run: |
+                  ./cyberfi-overlay/windows/Markala-Windows-Tepsisi.ps1 -EngineSource .
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  node cyberfi-overlay/branding/patch-compute-sdk.mjs --self-check
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  node cyberfi-overlay/branding/patch-compute-sdk.mjs .
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Build workspace JavaScript
               run: pnpm build
             - name: Verify source named-pipe transports before signing and compiling
@@ -197,6 +203,8 @@ jobs:
             - name: Verify compiled CyberFi tray icon and product metadata
               run: |
                   node cyberfi-overlay/branding/verify.mjs . win32
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  node cyberfi-overlay/branding/patch-compute-sdk.mjs . --verify
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   $tray = Get-Item packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-win32-x64.exe
                   if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne '0.4.117.0') { throw 'Native tray metadata mismatch' }

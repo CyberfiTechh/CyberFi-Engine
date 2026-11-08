@@ -62,7 +62,10 @@ jobs:
                   path: cyberfi-overlay
                   persist-credentials: false
             - name: Apply CyberFi tray and voice defaults before compiling JavaScript
-              run: node cyberfi-overlay/macos/markala-macos.mjs .
+              run: |
+                  node cyberfi-overlay/macos/markala-macos.mjs .
+                  node cyberfi-overlay/branding/patch-compute-sdk.mjs --self-check
+                  node cyberfi-overlay/branding/patch-compute-sdk.mjs .
             - name: Build workspace JavaScript
               run: |
                   pnpm --filter @slopus/happy-agent-supervisor build
@@ -102,6 +105,7 @@ jobs:
             - name: Verify compiled CyberFi tray pixels and native identity
               run: |
                   node cyberfi-overlay/branding/verify.mjs . darwin
+                  node cyberfi-overlay/branding/patch-compute-sdk.mjs . --verify
                   tray="packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-$TARGET"
                   codesign --verify --strict --verbose=2 "$tray"
                   codesign --display --verbose=2 "$tray" 2>&1 | grep '^Signature=adhoc$'

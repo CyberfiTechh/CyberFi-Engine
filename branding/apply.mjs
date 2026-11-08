@@ -95,14 +95,6 @@ export function apply(platform, directory) {
                 return homeFromRoot === ".." || homeFromRoot.startsWith(".." + sep) || isAbsolute(homeFromRoot);
             }),`, computePolicy);
   changes.push([computePolicy, computeText]);
-  const shellPolicy = join(root, 'packages/happy-agent-compute/sources/host/createHostShell.ts');
-  changes.push([shellPolicy, replace(readFileSync(shellPolicy, 'utf8').replaceAll('\r\n', '\n'),
-    `            ...(permissions.allowedReadPaths === undefined
-                ? {}
-                : { allowedReadPaths: permissions.allowedReadPaths }),`,
-    `            ...(permissions.allowedReadPaths === undefined && (options.hostPolicy?.readableDirectories?.length ?? 0) === 0
-                ? {}
-                : { allowedReadPaths: [...(permissions.allowedReadPaths ?? []), ...existingHostPaths(canonicalCwd, options.hostPolicy?.readableDirectories ?? [])] }),`, shellPolicy)]);
   changes.push([join(root, 'packages/happy-agent/scripts/cyberfi-smoke-skills.mjs'), readFileSync(join(here, 'smoke-skills.mjs'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/skills/CyberFiSkillsReadPolicy.test.ts'), readFileSync(join(here, 'SkillsReadPolicy.test.ts'), 'utf8')]);
   const voice = join(root, 'packages/happy-agent-modules/sources/live/impl/livePrompts.ts');
