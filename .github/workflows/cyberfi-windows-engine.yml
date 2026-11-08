@@ -38,6 +38,8 @@ jobs:
                   set -euo pipefail
                   cd release-assets
                   sha256sum -c happy-agent-0.4.117-preview.1-win32-x64.tar.gz.sha256
+                  gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > release-catalog.json
+                  jq -e '[.[][] | select(.tag_name == "v0.4.117-preview.1")] | length == 0' release-catalog.json > /dev/null
                   gh release create v0.4.117-preview.1 --repo "$GITHUB_REPOSITORY" \
                     --draft --prerelease --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.117-preview.1 (Windows x64)" \
                     --notes "Ön izleme: kurulu roller ve destek dosyaları kısıtlı ajanlarda salt okunur; genel ev dizini erişimi açılmaz. CyberFi simgesi ve Türkçe ses varsayılanları korunur. Üç mimari doğrulanana ve son inceleme tamamlanana kadar taslak tutulur. Kaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Önceki sürüm varlıkları değiştirilmez." \

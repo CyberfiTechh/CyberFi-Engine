@@ -79,21 +79,33 @@ export function apply(platform, directory) {
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
-  let computeText = replace(readFileSync(computePolicy, 'utf8'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, parse, relative, sep, type PlatformPath } from "node:path";', computePolicy);
+  let computeText = replace(readFileSync(computePolicy, 'utf8').replaceAll('\r\n', '\n'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, parse, relative, sep, type PlatformPath } from "node:path";\nimport { realpathSync, statSync } from "node:fs";', computePolicy);
+  computeText = replace(computeText,
+    `    get hostPolicy(): ComputeHostPolicy {
+        const values = this.#config.configuration.values;`,
+    `    get hostPolicy(): ComputeHostPolicy {
+        const values = this.#config.configuration.values;
+        const canonicalSkillPath = (path: string): string | undefined => {
+            try {
+                const canonical = realpathSync(path);
+                return statSync(canonical).isDirectory() ? canonical : undefined;
+            } catch { return undefined; }
+        };
+        const home = canonicalSkillPath(this.#config.resolveSkillDirectory("~"));`, computePolicy);
   computeText = replace(computeText,
     '            privateDirectories: [this.#config.configuration.paths.agentHome],',
     `            privateDirectories: [this.#config.configuration.paths.agentHome],
             // Installed instructions and their support files stay readable in restricted runs.
-            readableDirectories: [...new Set([
+            readableDirectories: home === undefined ? [] : [...new Set([
                 this.#config.globalSkillsRoot,
                 ...this.#config.globalSkillDirectories,
                 this.#config.configuration.paths.skillsHome,
-            ])].filter((directory) => {
-                // Never turn a broad configured root into access to the whole profile.
-                if (directory === parse(directory).root) return false;
-                const homeFromRoot = relative(directory, this.#config.resolveSkillDirectory("~"));
+            ].map(canonicalSkillPath).filter((directory): directory is string => {
+                // Store canonical narrow targets, never aliases that can be retargeted to HOME.
+                if (directory === undefined || relative(directory, parse(directory).root) === "") return false;
+                const homeFromRoot = relative(directory, home);
                 return homeFromRoot === ".." || homeFromRoot.startsWith(".." + sep) || isAbsolute(homeFromRoot);
-            }),`, computePolicy);
+            }))],`, computePolicy);
   changes.push([computePolicy, computeText]);
   changes.push([join(root, 'packages/happy-agent/scripts/cyberfi-smoke-skills.mjs'), readFileSync(join(here, 'smoke-skills.mjs'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/skills/CyberFiSkillsReadPolicy.test.ts'), readFileSync(join(here, 'SkillsReadPolicy.test.ts'), 'utf8')]);

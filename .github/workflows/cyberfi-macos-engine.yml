@@ -181,7 +181,11 @@ jobs:
                       sha256sum -c "$archive.sha256"
                       test "$(tar -tzf "$archive")" = "happy-agent-$target"
                   done
-                  release="repos/$GITHUB_REPOSITORY/releases/tags/v$HAPPY_AGENT_RELEASE_VERSION"
+                  # Drafts are not returned by GitHub's releases/tags endpoint.
+                  gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > release-catalog.json
+                  jq -e --arg tag "v$HAPPY_AGENT_RELEASE_VERSION" '[.[][] | select(.tag_name == $tag)] | length == 1' release-catalog.json > /dev/null
+                  release_id="$(jq -r --arg tag "v$HAPPY_AGENT_RELEASE_VERSION" '.[][] | select(.tag_name == $tag) | .id' release-catalog.json)"
+                  release="repos/$GITHUB_REPOSITORY/releases/$release_id"
                   gh api "$release" > before.json
                   jq -e '.draft == true and .prerelease == true' before.json > /dev/null
                   jq -e '.assets | any(.name == "happy-agent-0.4.117-preview.1-win32-x64.tar.gz")' before.json > /dev/null
