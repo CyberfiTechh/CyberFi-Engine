@@ -30,6 +30,8 @@ if (process.argv[4] !== '--source-only') {
   const compiled = readFileSync(join(root, 'packages/happy-agent-modules/dist/live/impl/livePrompts.js'), 'utf8');
   assert(compiled.includes('Sen CyberFi, tek bir masaüstü penceresinde'));
   assert(!compiled.includes('You are Happy, a calm, friendly voice companion'));
+  const policy = readFileSync(join(root, 'packages/happy-agent-modules/dist/compute/ComputeModule.js'), 'utf8');
+  for (const token of ['readableDirectories', 'globalSkillsRoot', 'globalSkillDirectories', 'skillsHome', 'homeFromRoot']) assert(policy.includes(token), `Missing compiled skill-read policy: ${token}`);
 }
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(here, 'asset-manifest.json')));

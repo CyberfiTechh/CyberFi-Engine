@@ -78,6 +78,32 @@ export function apply(platform, directory) {
   if (execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== revision) throw Error('Unexpected engine source revision');
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
+  const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
+  let computeText = replace(readFileSync(computePolicy, 'utf8'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, relative, sep, type PlatformPath } from "node:path";', computePolicy);
+  computeText = replace(computeText,
+    '            privateDirectories: [this.#config.configuration.paths.agentHome],',
+    `            privateDirectories: [this.#config.configuration.paths.agentHome],
+            // Installed instructions and their support files stay readable in restricted runs.
+            readableDirectories: [...new Set([
+                this.#config.globalSkillsRoot,
+                ...this.#config.globalSkillDirectories,
+                this.#config.configuration.paths.skillsHome,
+            ])].filter((directory) => {
+                // Never turn a broad configured root into access to the whole profile.
+                const homeFromRoot = relative(directory, this.#config.resolveSkillDirectory("~"));
+                return homeFromRoot === ".." || homeFromRoot.startsWith(".." + sep) || isAbsolute(homeFromRoot);
+            }),`, computePolicy);
+  changes.push([computePolicy, computeText]);
+  const shellPolicy = join(root, 'packages/happy-agent-compute/sources/host/createHostShell.ts');
+  changes.push([shellPolicy, replace(readFileSync(shellPolicy, 'utf8').replaceAll('\r\n', '\n'),
+    `            ...(permissions.allowedReadPaths === undefined
+                ? {}
+                : { allowedReadPaths: permissions.allowedReadPaths }),`,
+    `            ...(permissions.allowedReadPaths === undefined && (options.hostPolicy?.readableDirectories?.length ?? 0) === 0
+                ? {}
+                : { allowedReadPaths: [...(permissions.allowedReadPaths ?? []), ...existingHostPaths(canonicalCwd, options.hostPolicy?.readableDirectories ?? [])] }),`, shellPolicy)]);
+  changes.push([join(root, 'packages/happy-agent/scripts/cyberfi-smoke-skills.mjs'), readFileSync(join(here, 'smoke-skills.mjs'), 'utf8')]);
+  changes.push([join(root, 'packages/happy-agent-modules/tests/skills/CyberFiSkillsReadPolicy.test.ts'), readFileSync(join(here, 'SkillsReadPolicy.test.ts'), 'utf8')]);
   const voice = join(root, 'packages/happy-agent-modules/sources/live/impl/livePrompts.ts');
   if (!readFileSync(voice, 'utf8').includes('You are Happy, a calm, friendly voice companion')) throw Error('Unexpected pinned voice defaults');
   changes.push([voice, readFileSync(join(here, 'livePrompts.ts'), 'utf8')]);
@@ -86,7 +112,7 @@ export function apply(platform, directory) {
   for (const [name, entries] of Object.entries(platform === 'win32' ? windows : macos)) {
     const path = join(native, platform === 'win32' ? 'windows' : '', name);
     let text = translated(readFileSync(path, 'utf8'), entries, platform === 'win32', path);
-    if (name === 'WindowsTray.cs') text = replace(text, 'using System.Windows.Forms;', 'using System.Windows.Forms;\n[assembly: System.Reflection.AssemblyTitle("CyberFi ajan motoru")]\n[assembly: System.Reflection.AssemblyProduct("CyberFi")]\n[assembly: System.Reflection.AssemblyVersion("0.4.116.0")]\n[assembly: System.Reflection.AssemblyFileVersion("0.4.116.0")]', path);
+    if (name === 'WindowsTray.cs') text = replace(text, 'using System.Windows.Forms;', 'using System.Windows.Forms;\n[assembly: System.Reflection.AssemblyTitle("CyberFi ajan motoru")]\n[assembly: System.Reflection.AssemblyProduct("CyberFi")]\n[assembly: System.Reflection.AssemblyVersion("0.4.117.0")]\n[assembly: System.Reflection.AssemblyFileVersion("0.4.117.0")]', path);
     changes.push([path, text]);
   }
   const build = join(root, 'packages/happy-agent/scripts/build-binary.ts');

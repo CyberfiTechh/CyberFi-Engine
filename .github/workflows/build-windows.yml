@@ -175,7 +175,7 @@ jobs:
                   '@ | node
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Verify voice settings and custom prompt preservation
-              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts
+              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts tests/skills/CyberFiSkillsReadPolicy.test.ts
             - name: Authenticate signing with GitHub OIDC
               if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
               uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
@@ -199,10 +199,12 @@ jobs:
                   node cyberfi-overlay/branding/verify.mjs . win32
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   $tray = Get-Item packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-win32-x64.exe
-                  if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne '0.4.116.0') { throw 'Native tray metadata mismatch' }
+                  if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne '0.4.117.0') { throw 'Native tray metadata mismatch' }
             - name: Sign and verify the standalone executable
               if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
               run: ./scripts/sign-windows-files.ps1 -Directory packages/happy-agent/dist/bin
+            - name: Exercise installed skills in the actual restricted parent and child
+              run: node packages/happy-agent/scripts/cyberfi-smoke-skills.mjs packages/happy-agent/dist/bin/happy-agent-win32-x64.exe
             - name: Verify native libraries
               run: |
                   pnpm --filter @slopus/happy-agent test:native:monty

@@ -7,11 +7,11 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-macos-engine-0.4.116
+    group: cyberfi-macos-engine-0.4.117
     cancel-in-progress: false
 
 env:
-    HAPPY_AGENT_RELEASE_VERSION: "0.4.116"
+    HAPPY_AGENT_RELEASE_VERSION: "0.4.117"
 
 jobs:
     macos:
@@ -90,7 +90,7 @@ jobs:
                   node --expose-gc packages/happy-agent/scripts/verify-native-libsql.mjs
                   pnpm --filter @slopus/happy-agent exec pnpm dlx bun@1.4.4 scripts/verify-native-libsql.mjs
             - name: Verify voice settings and custom prompt preservation
-              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts
+              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts tests/skills/CyberFiSkillsReadPolicy.test.ts
             - name: Build and verify the owned native Python worker
               uses: ./.github/actions/build-monty
             - name: Verify patched watcher and Bun runtime
@@ -134,6 +134,8 @@ jobs:
                   done
                   echo "$status_output" >&2
                   exit 1
+            - name: Exercise installed skills in the actual restricted parent and child
+              run: node packages/happy-agent/scripts/cyberfi-smoke-skills.mjs packages/happy-agent/dist/bin/happy-agent-${{ matrix.target }}
             - name: Package the tested executable and checksum
               run: |
                   mkdir -p release-assets
@@ -178,12 +180,12 @@ jobs:
                   release="repos/$GITHUB_REPOSITORY/releases/tags/v$HAPPY_AGENT_RELEASE_VERSION"
                   gh api "$release" > before.json
                   jq -e '.draft == false and .prerelease == false' before.json > /dev/null
-                  jq -e '.assets | any(.name == "happy-agent-0.4.116-win32-x64.tar.gz")' before.json > /dev/null
+                  jq -e '.assets | any(.name == "happy-agent-0.4.117-win32-x64.tar.gz")' before.json > /dev/null
                   jq -e '.assets | all(.name | contains("darwin-") | not)' before.json > /dev/null
                   jq -S '[.assets[] | {id, name, size, digest, browser_download_url}] | sort_by(.id)' before.json > preserved.json
                   gh release upload "v$HAPPY_AGENT_RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
-                    happy-agent-0.4.116-darwin-x64.tar.gz happy-agent-0.4.116-darwin-x64.tar.gz.sha256 \
-                    happy-agent-0.4.116-darwin-arm64.tar.gz happy-agent-0.4.116-darwin-arm64.tar.gz.sha256
+                    happy-agent-0.4.117-darwin-x64.tar.gz happy-agent-0.4.117-darwin-x64.tar.gz.sha256 \
+                    happy-agent-0.4.117-darwin-arm64.tar.gz happy-agent-0.4.117-darwin-arm64.tar.gz.sha256
                   gh api "$release" > after.json
                   jq -S '[.assets[] | select(.name | contains("darwin-") | not) | {id, name, size, digest, browser_download_url}] | sort_by(.id)' after.json > retained.json
                   cmp preserved.json retained.json
@@ -192,4 +194,4 @@ jobs:
                       jq -e --arg name "$archive" --arg digest "sha256:$digest" \
                         '.assets | any(.name == $name and .digest == $digest)' after.json > /dev/null
                   done
-                  echo 'Added verified native Mac archives to v0.4.116; existing release assets retained.' >> "$GITHUB_STEP_SUMMARY"
+                  echo 'Added verified native Mac archives to v0.4.117; existing release assets retained.' >> "$GITHUB_STEP_SUMMARY"

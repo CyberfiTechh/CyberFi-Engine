@@ -7,7 +7,7 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-windows-engine-0.4.116
+    group: cyberfi-windows-engine-0.4.117
     cancel-in-progress: false
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
             contents: read
             id-token: write
         with:
-            version: "0.4.116"
+            version: "0.4.117"
 
     publish:
         if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
@@ -37,9 +37,9 @@ jobs:
               run: |
                   set -euo pipefail
                   cd release-assets
-                  sha256sum -c happy-agent-0.4.116-win32-x64.tar.gz.sha256
-                  gh release create v0.4.116 --repo "$GITHUB_REPOSITORY" \
-                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.116 (Windows x64)" \
+                  sha256sum -c happy-agent-0.4.117-win32-x64.tar.gz.sha256
+                  gh release create v0.4.117 --repo "$GITHUB_REPOSITORY" \
+                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.117 (Windows x64)" \
                     --notes "CyberFi simgesi ve Türkçe Windows tepsisi. Kaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Doğrulanan macOS paketleri aynı yeni sürüme ayrıca eklenir; önceki sürüm varlıkları değiştirilmez." \
-                    happy-agent-0.4.116-win32-x64.tar.gz happy-agent-0.4.116-win32-x64.tar.gz.sha256
-                  gh release edit v0.4.116 --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+                    happy-agent-0.4.117-win32-x64.tar.gz happy-agent-0.4.117-win32-x64.tar.gz.sha256
+                  gh release edit v0.4.117 --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
