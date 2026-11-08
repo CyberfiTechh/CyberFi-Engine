@@ -583,7 +583,7 @@ index 2b82c77d4e946a794d1e838e98c3aaec12b9fd9c..dee8526a52d09b2e5f85a2940fac8fbf
              "Keep delegated work in the subtask. Ask its agent through send_agent_message for progress, findings, diffs, verification, or follow-up changes. Do not directly inspect or modify its files or run commands in its workspace. Direct access to another workspace often requires elevated permissions and review by the reviewer model; talking to its agent avoids unnecessary permission reviews.",
              `Choose a model and effort; harness and provider default to yours when they serve the model.\n\n${options}\n\nCall agent_options for the current list.`,
 diff --git a/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts b/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
-index 03b59e4922124e86e6ededf2380c4031fcb582aa..f705c47cb87ad62c96d0053982979d794b7b78b5 100644
+index 03b59e4922124e86e6ededf2380c4031fcb582aa..27d711dfb9153c319f26ec4d5b1094480418a11c 100644
 --- a/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
 +++ b/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
 @@ -1,4 +1,8 @@
@@ -653,7 +653,7 @@ index 03b59e4922124e86e6ededf2380c4031fcb582aa..f705c47cb87ad62c96d0053982979d79
  }
  
  function computeModule(): ComputeModule {
-@@ -2228,12 +2258,517 @@ describe("collaborator permission modes", () => {
+@@ -2228,12 +2258,523 @@ describe("collaborator permission modes", () => {
          });
      });
  
@@ -727,9 +727,15 @@ index 03b59e4922124e86e6ededf2380c4031fcb582aa..f705c47cb87ad62c96d0053982979d79
 +        const senderTools = await hooks.tools!(ctx, {
 +            agent: { id: "parent", provider: "codex", permissionMode: "full_access" },
 +        } as never);
++        const input = {
++            toAgentId: "oldchild",
++            explanation: "Continue owned full access check",
++            text: "Continue",
++        };
++        expect(Value.Check(collaborationSendToolInputSchema, input)).toBe(true);
 +        await senderTools
 +            .find((tool) => tool.name === "send_agent_message")!
-+            .execute(ctx, { toAgentId: "oldchild", text: "Continue" }, toolCall("followup"));
++            .execute(ctx, input, toolCall("followup"));
 +        expect(collection.steered.at(-1)!.options).toMatchObject({
 +            permissionMode: "full_access",
 +            metadata: { mode: { ...(previous as object), permissionMode: "full_access" } },
@@ -768,8 +774,7 @@ index 03b59e4922124e86e6ededf2380c4031fcb582aa..f705c47cb87ad62c96d0053982979d79
 +            permissionMode: "read_only",
 +        });
 +    });
- 
--        expect(collection.delivered[0]!.options.permissionMode).toBe("read_only");
++
 +    it.each(["agent", "guest", "missing"])(
 +        "never treats %s-origin full metadata as a human followup grant",
 +        async (origin) => {
@@ -825,7 +830,8 @@ index 03b59e4922124e86e6ededf2380c4031fcb582aa..f705c47cb87ad62c96d0053982979d79
 +        await acceptHuman(hooks, ctx, "parent", "full_access", "human-full");
 +        expect((await permissionState("parent")).grant).toEqual(first);
 +    });
-+
+ 
+-        expect(collection.delivered[0]!.options.permissionMode).toBe("read_only");
 +    it("does not widen a legacy grandchild across a pending human restriction on its intermediate ancestor", async () => {
 +        const { collection, create, ctx, hooks, module, permissionState } =
 +            await createToolIn("full_access");

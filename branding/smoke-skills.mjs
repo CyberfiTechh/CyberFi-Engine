@@ -206,8 +206,8 @@ try {
     const fullGrandchildId = await fullProof(fullChildId, 'FULL_ACCESS_CHILD_SENTINEL', true);
     await fullProof(fullGrandchildId, 'FULL_ACCESS_GRANDCHILD_SENTINEL', false);
     assert.equal((await client.getMode(childId)).mode?.permissionMode, 'read_only');
-    const followed = await request(parent, { name: 'send_agent_message', arguments: { toAgentId: childId, text: 'EXISTING_CHILD_FULL_CHECK Run only the owned native shell and MCP checks.' } }, 'full_access');
-    assert.equal(followed.status, 'completed');
+    const followed = await request(parent, { name: 'send_agent_message', arguments: { toAgentId: childId, explanation: 'Continue owned full access check', text: 'EXISTING_CHILD_FULL_CHECK Run only the owned native shell and MCP checks.' } }, 'full_access');
+    assert.equal(followed.status, 'completed', 'Owned existing-child steering failed: ' + String(output(followed) ?? '').slice(0, 1024));
     await fullProof(childId, 'EXISTING_CHILD_FULL_SENTINEL', false);
     const catalog = await request(parent, { name: 'list_mcp_tools', arguments: { server: 'Math Core' } }, 'full_access');
     assert.equal(catalog.status, 'completed'); assert(output(catalog).includes('echo'), 'Native MCP display alias did not resolve');

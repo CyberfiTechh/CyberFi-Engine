@@ -165,9 +165,12 @@ export function apply(platform, directory) {
   changes.push([join(root, 'packages/happy-agent-modules/tests/compute/CyberFiCommandToolsReady.test.ts'), readFileSync(join(here, 'CommandToolsReady.test.ts'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/compute/CyberFiCommandToolReadPolicy.test.ts'), readFileSync(join(here, 'CommandToolReadPolicy.test.ts'), 'utf8')]);
   const mcpRetryTest = join(root, 'packages/happy-agent-modules/tests/mcp/McpModule.test.ts');
-  // The retry assertion already allows ten seconds; Vitest's five-second default cuts it off.
+  // The missing gate still forces a timeout; allow a cold child process to initialize after release.
+  let mcpRetryText = readFileSync(mcpRetryTest, 'utf8').replaceAll('\r\n', '\n');
+  mcpRetryText = replace(mcpRetryText, '{ slow: { ...gate.server, startupTimeoutMs: 300 } }', '{ slow: { ...gate.server, startupTimeoutMs: 2000 } }', mcpRetryTest);
+  mcpRetryText = replace(mcpRetryText, '.poll(async () => (await module.listServerPage(ctx, "agent-a")).servers)\n                .toMatchObject([{ name: "slow", status: "failed", toolCount: 0 }]);', '.poll(async () => (await module.listServerPage(ctx, "agent-a")).servers, { timeout: 5000 })\n                .toMatchObject([{ name: "slow", status: "failed", toolCount: 0 }]);', mcpRetryTest);
   const retryEnd = '    });\n\n    it("restarts a server whose process stopped"';
-  changes.push([mcpRetryTest, replace(readFileSync(mcpRetryTest, 'utf8').replaceAll('\r\n', '\n'), retryEnd, '    }, 15_000);\n\n    it("restarts a server whose process stopped"', mcpRetryTest)]);
+  changes.push([mcpRetryTest, replace(mcpRetryText, retryEnd, '    }, 20_000);\n\n    it("restarts a server whose process stopped"', mcpRetryTest)]);
   changes.push([join(root, 'packages/happy-agent/scripts/cyberfi-smoke-skills.mjs'), readFileSync(join(here, 'smoke-skills.mjs'), 'utf8')]);
   changes.push([join(root, 'packages/happy-agent-modules/tests/skills/CyberFiSkillsReadPolicy.test.ts'), readFileSync(join(here, 'SkillsReadPolicy.test.ts'), 'utf8')]);
   const voice = join(root, 'packages/happy-agent-modules/sources/live/impl/livePrompts.ts');
