@@ -105,7 +105,7 @@ export function apply(platform, directory) {
   for (const [name, entries] of Object.entries(platform === 'win32' ? windows : macos)) {
     const path = join(native, platform === 'win32' ? 'windows' : '', name);
     let text = translated(readFileSync(path, 'utf8'), entries, platform === 'win32', path);
-    if (name === 'WindowsTray.cs') text = replace(text, 'using System.Windows.Forms;', 'using System.Windows.Forms;\n[assembly: System.Reflection.AssemblyTitle("CyberFi ajan motoru")]\n[assembly: System.Reflection.AssemblyProduct("CyberFi")]\n[assembly: System.Reflection.AssemblyVersion("0.4.117.0")]\n[assembly: System.Reflection.AssemblyFileVersion("0.4.117.0")]', path);
+    if (name === 'WindowsTray.cs') text = replace(text, 'using System.Windows.Forms;', 'using System.Windows.Forms;\n[assembly: System.Reflection.AssemblyTitle("CyberFi ajan motoru")]\n[assembly: System.Reflection.AssemblyProduct("CyberFi")]\n[assembly: System.Reflection.AssemblyInformationalVersion("0.4.117-preview.1")]\n[assembly: System.Reflection.AssemblyVersion("0.4.117.0")]\n[assembly: System.Reflection.AssemblyFileVersion("0.4.117.0")]', path);
     changes.push([path, text]);
   }
   const build = join(root, 'packages/happy-agent/scripts/build-binary.ts');
