@@ -205,6 +205,14 @@ jobs:
               run: ./scripts/sign-windows-files.ps1 -Directory packages/happy-agent/dist/bin
             - name: Exercise installed skills in the actual restricted parent and child
               run: node packages/happy-agent/scripts/cyberfi-smoke-skills.mjs packages/happy-agent/dist/bin/happy-agent-win32-x64.exe
+            - name: Retain failed candidate for isolated diagnosis
+              if: failure()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: cyberfi-engine-candidate-win32-x64
+                  path: packages/happy-agent/dist/bin/happy-agent-win32-x64.exe
+                  if-no-files-found: ignore
+                  retention-days: 1
             - name: Verify native libraries
               run: |
                   pnpm --filter @slopus/happy-agent test:native:monty

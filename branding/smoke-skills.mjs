@@ -39,11 +39,15 @@ const fixture = createServer(async (request, response) => {
             const stage = stages.get(key) ?? 0;
             const calls = [
                 ['read_skill', { name: 'owned-review' }],
-                ['exec_command', { cmd: readCommand(support), yield_time_ms: 1000 }],
+                ['exec_command', { cmd: readCommand(support), yield_time_ms: 30000 }],
             ];
             if (stage < calls.length) {
                 stages.set(key, stage + 1);
                 content = [{ type: 'tool_call', callId: `owned-${stage}`, name: calls[stage][0], arguments: calls[stage][1] }];
+            } else {
+                const signals = [...JSON.stringify(input.context?.messages ?? input.messages ?? []).matchAll(/Process (?:running with session ID (\d+)|exited with code -?\d+)/g)];
+                const pending = signals.at(-1)?.[1];
+                if (pending) content = [{ type: 'tool_call', callId: `owned-poll-${randomUUID()}`, name: 'write_stdin', arguments: { session_id: Number(pending), chars: '', yield_time_ms: 30000 } }];
             }
         }
         response.writeHead(200, { 'content-type': 'application/json' });
@@ -87,6 +91,17 @@ async function request(agentId, tool) {
         assert(found, 'Requested tool missing'); return found;
     });
 }
+async function shellRead(agentId, path) {
+    let tool = await request(agentId, { name: 'exec_command', arguments: { cmd: readCommand(path), yield_time_ms: 30000 } });
+    let text = output(tool);
+    for (let attempts = 0; attempts < 4; attempts++) {
+        const running = /Process running with session ID (\d+)/.exec(output(tool));
+        if (!running) return text;
+        tool = await request(agentId, { name: 'write_stdin', arguments: { session_id: Number(running[1]), chars: '', yield_time_ms: 30000 } });
+        text += '\n' + output(tool);
+    }
+    throw Error('Owned shell read did not finish');
+}
 try {
     const token = (await wait(() => readFile(join(happyHome, 'agent', 'token'), 'utf8'))).trim();
     const socket = getHappyDaemonPaths({ HAPPY_HOME_DIR: happyHome }).socketPath;
@@ -95,21 +110,23 @@ try {
     const parent = (await client.createBot({ name: 'Owned native skill smoke' })).bot.agent.id;
     const read = await request(parent, { name: 'read_skill', arguments: { name: 'owned-review' } });
     assert.equal(read.status, 'completed'); assert(output(read).includes('OWNED_ROLE_INSTRUCTIONS'));
-    const reference = await request(parent, { name: 'exec_command', arguments: { cmd: readCommand(support), yield_time_ms: 1000 } });
-    assert(output(reference).includes('OWNED_SUPPORT_SENTINEL'), 'Restricted parent cannot read skill support through its actual shell tool');
-    const denied = await request(parent, { name: 'exec_command', arguments: { cmd: readCommand(unrelated), yield_time_ms: 1000 } });
-    assert(!output(denied).includes('UNRELATED_PRIVATE_SENTINEL'), 'Unrelated private file exposed');
+    const reference = await shellRead(parent, support);
+    assert(reference.includes('OWNED_SUPPORT_SENTINEL'), 'Restricted parent support read failed: ' + reference);
+    const denied = await shellRead(parent, unrelated);
+    assert(!denied.includes('UNRELATED_PRIVATE_SENTINEL'), 'Unrelated private file exposed');
     const created = await request(parent, { name: 'create_agent', arguments: { title: 'Owned read-only child', model: 'openai/gym', provider: 'gym', effort: 'off', read_only: true, text: 'CHILD_SKILL_CHECK Read the owned role and support file. No other actions.' } });
     assert.equal(created.status, 'completed');
     const childId = /Created collaborator ([a-z0-9]+)/.exec(output(created))?.[1]; assert(childId, 'Missing created child ID');
     await wait(async () => {
         const calls = toolsOf(await client.getMessages(childId, { limit: 100 }));
         const skill = calls.find(tool => tool.name === 'read_skill' && tool.status !== 'running');
-        const file = calls.find(tool => tool.name === 'exec_command' && tool.status !== 'running');
+        const shellCalls = calls.filter(tool => ['exec_command', 'write_stdin'].includes(tool.name) && tool.status !== 'running');
+        const file = shellCalls.at(-1);
         if (!skill || !file) return undefined;
         assert.equal(skill.status, 'completed'); assert(output(skill).includes('OWNED_ROLE_INSTRUCTIONS'));
-        assert(output(file).includes('OWNED_SUPPORT_SENTINEL'), 'Read-only child cannot read skill support'); return true;
-    });
+        if (/Process running with session ID \d+/.test(output(file))) return undefined;
+        assert(shellCalls.some(tool => output(tool).includes('OWNED_SUPPORT_SENTINEL')), 'Read-only child support read failed: ' + output(file)); return true;
+    }, 120000);
     assert.equal(await readFile(support, 'utf8'), 'OWNED_SUPPORT_SENTINEL');
     assert.equal(await readFile(unrelated, 'utf8'), 'UNRELATED_PRIVATE_SENTINEL');
     console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, paidInference: false }));
