@@ -1,0 +1,41 @@
+name: Diagnose native skill candidate
+on:
+    workflow_dispatch:
+permissions:
+    contents: read
+    actions: read
+jobs:
+    diagnose:
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
+        runs-on: windows-2025
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+              with:
+                  node-version: '24'
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: cyberfi-engine-candidate-win32-x64
+                  repository: CyberfiTechh/CyberFi-Engine
+                  run-id: 42428990185
+                  github-token: ${{ github.token }}
+                  path: candidate
+            - name: Verify exact candidate and prepare disposable native boundary
+              shell: pwsh
+              run: |
+                  if ($env:GITHUB_REPOSITORY -ne 'CyberfiTechh/CyberFi-Engine' -or $env:GITHUB_ACTIONS -ne 'true') { throw 'Wrong execution surface' }
+                  $binary = (Resolve-Path candidate/happy-agent-win32-x64.exe).Path
+                  if ((Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne '0eafde5a059bdaacae4cc99000a2dee4d6c3bc14397a1b957c2e5e4207ea0177') { throw 'Candidate SHA mismatch' }
+                  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+                  if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Ephemeral runner must already be elevated' }
+                  & $binary sandbox setup
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  $status = (& $binary sandbox status) -join "`n"
+                  if ($LASTEXITCODE -ne 0 -or $status -notmatch '(?m)^State directory: (.+)$') { throw 'Missing sandbox state' }
+                  "HAPPY_WINDOWS_SANDBOX_HOME=$($Matches[1].Trim())" >> $env:GITHUB_ENV
+                  'HAPPY_WINDOWS_SANDBOX_NO_PROVISION=1' >> $env:GITHUB_ENV
+            - name: Observe actual restricted skill and support access
+              run: node branding/smoke-skills.mjs candidate/happy-agent-win32-x64.exe

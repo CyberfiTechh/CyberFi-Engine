@@ -1,13 +1,33 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createServer, request as httpRequest } from 'node:http';
 import { homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
-import { HappyAgentClient } from '@slopus/happy-agent-client';
-import { createUnixSocketFetch } from '../dist/lifecycle/createUnixSocketFetch.js';
-import { getHappyDaemonPaths } from '../dist/lifecycle/getHappyDaemonPaths.js';
+import { dirname, join, resolve, sep, win32 } from 'node:path';
+
+// Same public v0 routes and socket identity as pinned HappyAgentClient/localAgentPaths.
+function clientFor(socketPath, token) {
+    const json = (method, path, value) => new Promise((done, fail) => {
+        const body = value === undefined ? undefined : JSON.stringify(value);
+        const request = httpRequest({ socketPath, path: '/' + path, method,
+            headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }) } }, response => {
+            const chunks = []; response.on('data', chunk => chunks.push(chunk)); response.on('end', () => {
+                const text = Buffer.concat(chunks).toString();
+                if (response.statusCode < 200 || response.statusCode >= 300) return fail(Error(`Owned API ${method} ${path}: ${response.statusCode} ${text}`));
+                try { done(text ? JSON.parse(text) : {}); } catch (error) { fail(error); }
+            });
+        });
+        request.on('error', fail); request.end(body);
+    });
+    return {
+        getHealth: () => json('GET', 'v0/health'),
+        createBot: body => json('POST', 'v0/bots', body),
+        sendMessage: (id, body) => json('POST', `v0/agents/${encodeURIComponent(id)}/send`, body),
+        getMessages: id => json('GET', `v0/agents/${encodeURIComponent(id)}/messages?limit=100`),
+        shutdown: () => json('POST', 'v0/shutdown'),
+    };
+}
 
 const binary = resolve(process.argv[2]);
 const root = await mkdtemp(join(homedir(), 'cyberfi-skill-smoke-'));
@@ -51,7 +71,7 @@ const fixture = createServer(async (request, response) => {
             }
         }
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ content, stopReason: content[0].type === 'tool_call' ? 'tool_use' : 'stop' }));
+        response.end(JSON.stringify({ content, stopReason: content[0].type === 'tool_call' ? 'toolUse' : 'stop' }));
     } catch (error) { response.writeHead(500).end(String(error)); }
 });
 await new Promise(done => fixture.listen(0, '127.0.0.1', done));
@@ -104,8 +124,9 @@ async function shellRead(agentId, path) {
 }
 try {
     const token = (await wait(() => readFile(join(happyHome, 'agent', 'token'), 'utf8'))).trim();
-    const socket = getHappyDaemonPaths({ HAPPY_HOME_DIR: happyHome }).socketPath;
-    client = new HappyAgentClient({ endpoint: 'http://cyberfi.owned-smoke', fetch: createUnixSocketFetch(socket), token });
+    const directory = join(happyHome, 'agent');
+    const socket = process.platform === 'win32' ? '\\\\.\\pipe\\happy-agent-' + createHash('sha256').update(win32.resolve(directory).toLowerCase()).digest('hex') : join(directory, 'server.sock');
+    client = clientFor(socket, token);
     await wait(async () => (await client.getHealth()).ready);
     const parent = (await client.createBot({ name: 'Owned native skill smoke' })).bot.agent.id;
     const read = await request(parent, { name: 'read_skill', arguments: { name: 'owned-review' } });
@@ -130,6 +151,22 @@ try {
     assert.equal(await readFile(support, 'utf8'), 'OWNED_SUPPORT_SENTINEL');
     assert.equal(await readFile(unrelated, 'utf8'), 'UNRELATED_PRIVATE_SENTINEL');
     console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, paidInference: false }));
+} catch (error) {
+    if (process.platform === 'win32') {
+        const paths = [root, join(root, '.agents'), join(root, '.agents', 'skills'), role, support];
+        const command = paths.map(path => `Write-Output '${path}'; (Get-Acl -LiteralPath '${path}').Sddl`).join('; ');
+        const diagnostic = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', windowsHide: true });
+        console.error('Owned fixture ACLs:\n' + diagnostic.stdout);
+        const state = process.env.HAPPY_WINDOWS_SANDBOX_HOME;
+        if (state) {
+            const logs = join(state, '.sandbox');
+            for (const name of (await readdir(logs).catch(() => [])).filter(name => name.endsWith('.log')).sort().slice(-3)) {
+                const lines = (await readFile(join(logs, name), 'utf8')).split(/\r?\n/).filter(line => line.includes(root) || /read ACL|read-acl-only|prepare selected project/.test(line));
+                console.error('Owned read ACL trace:\n' + lines.slice(-50).join('\n'));
+            }
+        }
+    }
+    throw error;
 } finally {
     await client?.shutdown().catch(() => undefined);
     daemon.kill('SIGTERM');
