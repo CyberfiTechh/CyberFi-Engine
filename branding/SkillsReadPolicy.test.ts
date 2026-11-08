@@ -72,7 +72,7 @@ it("lets restricted parents and read-only children read installed skills and sup
         ]));
         expect(compute.hostPolicy.readableDirectories).not.toContain(home);
         expect(config.globalSkillDirectories).toContain(home);
-        vi.spyOn(config, "globalSkillDirectories", "get").mockReturnValue([extra, home, root, parse(home).root]);
+        vi.spyOn(config, "globalSkillDirectories", "get").mockReturnValue([extra, home, root, parse(home).root, ...(process.platform === "win32" ? ["Z:\\"] : [])]);
         expect(compute.hostPolicy.readableDirectories).toEqual([
             config.globalSkillsRoot, extra, config.configuration.paths.skillsHome,
         ]);

@@ -79,7 +79,7 @@ export function apply(platform, directory) {
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
-  let computeText = replace(readFileSync(computePolicy, 'utf8'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, relative, sep, type PlatformPath } from "node:path";', computePolicy);
+  let computeText = replace(readFileSync(computePolicy, 'utf8'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, parse, relative, sep, type PlatformPath } from "node:path";', computePolicy);
   computeText = replace(computeText,
     '            privateDirectories: [this.#config.configuration.paths.agentHome],',
     `            privateDirectories: [this.#config.configuration.paths.agentHome],
@@ -90,6 +90,7 @@ export function apply(platform, directory) {
                 this.#config.configuration.paths.skillsHome,
             ])].filter((directory) => {
                 // Never turn a broad configured root into access to the whole profile.
+                if (directory === parse(directory).root) return false;
                 const homeFromRoot = relative(directory, this.#config.resolveSkillDirectory("~"));
                 return homeFromRoot === ".." || homeFromRoot.startsWith(".." + sep) || isAbsolute(homeFromRoot);
             }),`, computePolicy);
