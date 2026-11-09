@@ -217,6 +217,9 @@ jobs:
             - name: Verify the Bun runtime before compiling
               run: pnpm --filter @slopus/happy-agent test:bun:runtime
 
+            - name: Verify both bundle inputs use the patched Windows ACL timeout
+              run: node cyberfi-overlay/branding/patch-compute-sdk.mjs . --verify
+
             - name: Build standalone executable with signed embedded native assets when enabled
               run: pnpm --filter @slopus/happy-agent build:bun --target win32-x64
             - name: Verify compiled CyberFi tray icon and product metadata

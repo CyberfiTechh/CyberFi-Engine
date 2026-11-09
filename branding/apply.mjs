@@ -74,7 +74,7 @@ enum StatusIcon {
 ${animation}`;
 }
 export function apply(platform, directory) {
-  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.124';
+  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.125';
   if (releaseVersion.trim() !== releaseVersion || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-preview\.(0|[1-9]\d*))?$/.test(releaseVersion) || releaseVersion.split('-')[0].split('.').some(part => Number(part) > 65535)) throw Error('Invalid native engine release version');
   const assemblyVersion = releaseVersion.split('-')[0] + '.0';
   const root = resolve(directory);
