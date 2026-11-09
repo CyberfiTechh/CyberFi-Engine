@@ -48,7 +48,7 @@ jobs:
                   github-token: ${{ github.token }}
             - name: Prepare disposable native Windows boundary and staged fixtures
               run: |
-                  node cyberfi-overlay/branding/apply.mjs win32 .
+                  node --input-type=module -e "import { apply } from './cyberfi-overlay/branding/apply.mjs'; apply('win32', '.')"
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   $binary = (Resolve-Path candidate/happy-agent-win32-x64.exe).Path
                   if ((& $binary --version) -ne 'Happy Agent 0.4.121-preview.1') { throw 'Candidate version mismatch' }
