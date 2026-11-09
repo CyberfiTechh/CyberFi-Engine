@@ -1,0 +1,239 @@
+diff --git a/packages/happy-agent-modules/sources/workspaces/impl/removeWorkspaceDirectory.ts b/packages/happy-agent-modules/sources/workspaces/impl/removeWorkspaceDirectory.ts
+index c84276b..8fde272 100644
+--- a/packages/happy-agent-modules/sources/workspaces/impl/removeWorkspaceDirectory.ts
++++ b/packages/happy-agent-modules/sources/workspaces/impl/removeWorkspaceDirectory.ts
+@@ -81,8 +81,19 @@ export async function removeWorkspaceDirectory(options: {
+     }
+ 
+     if (await machine.fs.exists(PRODUCT, project.repositoryRef)) {
++        const placement: { runnerId?: string } =
++            workspace.runnerId === undefined ? {} : { runnerId: workspace.runnerId };
++        if (
++            workspace.status === "archiving" &&
++            workspaceExists &&
++            !(await machine.fs.exists(PRODUCT, options.paths.join(workspace.path, ".git"))) &&
++            (await isUnregisteredArchiveFolder(options, commonDir, placement))
++        ) {
++            // Git no longer owns this folder. Finish archiving the record without touching it.
++            return;
++        }
+         await options.git.removeWorktree({
+-            ...(workspace.runnerId === undefined ? {} : { runnerId: workspace.runnerId }),
++            ...placement,
+             expectedCommonDir: commonDir,
+             projectPath: project.repositoryRef,
+             removeDirectory: workspaceExists,
+@@ -99,3 +110,56 @@ export async function removeWorkspaceDirectory(options: {
+     if (workspaceExists)
+         await machine.fs.rm(PRODUCT, workspace.path, { force: true, recursive: true });
+ }
++
++async function isUnregisteredArchiveFolder(
++    { git, machine, paths, project, workspace }: Parameters<typeof removeWorkspaceDirectory>[0],
++    commonDir: string,
++    placement: { runnerId?: string },
++): Promise<boolean> {
++    const normalize = (value: string) => {
++        const absolute = paths.resolve(value);
++        return paths.sep === "\\" ? absolute.toLowerCase() : absolute;
++    };
++    if (
++        !paths.isAbsolute(commonDir) ||
++        normalize(await git.commonDir(project.repositoryRef, placement)) !== normalize(commonDir)
++    ) {
++        return false;
++    }
++    const maxOutputBytes = 128 * 1024;
++    const listing = await git.run(project.repositoryRef, ["worktree", "list", "--porcelain", "-z"], {
++        ...placement,
++        maxOutputBytes,
++    });
++    if (
++        listing.code !== 0 ||
++        listing.stderr.trim() !== "" ||
++        Buffer.byteLength(listing.stdout, "utf8") >= maxOutputBytes ||
++        !listing.stdout.endsWith("\0\0") ||
++        /\uFFFD|\.\.\. \d+ bytes omitted \.\.\./u.test(listing.stdout)
++    ) {
++        return false;
++    }
++    const workspacePath = normalize(workspace.path);
++    const records = listing.stdout.slice(0, -2).split("\0\0");
++    if (records.length > 128) return false;
++    for (const record of records) {
++        const [header = "", ...fields] = record.split("\0");
++        const path = header.slice("worktree ".length);
++        if (
++            !header.startsWith("worktree ") ||
++            !paths.isAbsolute(path) ||
++            fields.some((field) => field.startsWith("worktree ")) ||
++            normalize(path) === workspacePath
++        ) {
++            return false;
++        }
++        try {
++            // An alias may name the same checkout even when Git reports a different path.
++            if (normalize(await machine.fs.realpath(PRODUCT, path)) === workspacePath) return false;
++        } catch (error) {
++            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
++        }
++    }
++    return true;
++}
+diff --git a/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts b/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts
+index 42aadbb..10273e0 100644
+--- a/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts
++++ b/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts
+@@ -1,6 +1,9 @@
++import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
++import { join } from "node:path";
++
+ import type { AgentSystemRef } from "@slopus/happy-agent-base";
+ import { afterCommit, type Context } from "@steve.kite/stdlib";
+-import { describe, expect, it, vi } from "vitest";
++import { afterEach, describe, expect, it, vi } from "vitest";
+ 
+ import { AbortModule } from "../../sources/abort/index.js";
+ import { ComputeModule } from "../../sources/compute/index.js";
+@@ -14,7 +17,8 @@ import { RunnersModule } from "../../sources/runners/index.js";
+ import { SecretsModule } from "../../sources/secrets/index.js";
+ import { archiveWorkspaceTool } from "../../sources/workspaces/tools/archive_workspace.js";
+ import { workspaceMigrations, WorkspacesModule } from "../../sources/workspaces/index.js";
+-import { temporaryTestConfig } from "../support/configModule.js";
++import { cleanupRoots, commitFile, createRepository, createRoot, git } from "../git/helpers.js";
++import { temporaryTestConfig, testConfigRootedAt } from "../support/configModule.js";
+ import { moduleDatabase } from "../support/moduleDatabase.js";
+ 
+ /**
+@@ -63,8 +67,9 @@ class RecordingCollection {
+  * workspaces hold separate lists of agents, and archiving a project has to reach both attachment
+  * surfaces independently.
+  */
+-async function archivingCatalog(name: string) {
+-    const config = await temporaryTestConfig();
++async function archivingCatalog(name: string, root?: string) {
++    const config =
++        root === undefined ? await temporaryTestConfig() : await testConfigRootedAt(root);
+     const git = new GitModule();
+     const abort = new AbortModule(new ComputeModule(config, new SecretsModule()));
+     const durableFunctions = new DurableFunctionsModule();
+@@ -120,6 +125,103 @@ function toolCall() {
+ }
+ 
+ describe("archiving stops the work standing in a workspace", () => {
++    afterEach(cleanupRoots);
++
++    it.each([
++        { registry: "complete", status: "archived" },
++        { registry: "truncated", status: "archiving" },
++    ])(
++        "preserves an unregistered worktree with a $registry Git listing ($status)",
++        async ({ registry, status }) => {
++            const repository = await createRepository();
++            const baseCommit = await commitFile(repository, "README.md", "source project\n");
++            const world = await archivingCatalog(
++                "workspace-archive-unregistered",
++                await createRoot(),
++            );
++            try {
++                const project = await world.projects.create(world.ctx, {
++                    id: "acme",
++                    name: "Acme",
++                    repositoryRef: world.git.normalizeProjectCwd(repository),
++                });
++                const { workspace } = await world.workspaces.reserve(world.ctx, {
++                    id: "workspace-1",
++                    projectRef: project.id,
++                    name: "Unregistered worktree",
++                    kind: "git_worktree",
++                    baseRef: "main",
++                    baseCommit,
++                    gitCommonDir: await world.git.commonDir(repository),
++                });
++                await mkdir(join(workspace.path, "nested"), { recursive: true });
++                const file = join(workspace.path, "nested", "öğrenci.txt");
++                const content = Buffer.from("saklanan dosya\nçğıöşü\n", "utf8");
++                await writeFile(file, content);
++                await world.workspaces.markReady(world.ctx, { workspaceId: workspace.id });
++
++                const directoryBefore = await stat(workspace.path);
++                const fileBefore = await stat(file);
++                const registryBefore = await git(repository, [
++                    "worktree",
++                    "list",
++                    "--porcelain",
++                    "-z",
++                ]);
++                const removeWorktree = vi.spyOn(world.git, "removeWorktree");
++                const originalRun = world.git.run.bind(world.git);
++                const runGit = vi.spyOn(world.git, "run");
++                let incompleteListings = 0;
++                if (registry === "truncated") {
++                    runGit.mockImplementation(async (cwd, args, options) => {
++                        const result = await originalRun(cwd, args, options);
++                        if (args[0] !== "worktree" || args[1] !== "list") return result;
++                        incompleteListings += 1;
++                        return { ...result, stdout: result.stdout.slice(0, -1) };
++                    });
++                }
++                expect(await readdir(workspace.path)).toEqual(["nested"]);
++                expect((await world.workspaces.archive(world.ctx, workspace.id)).status).toBe(
++                    "archiving",
++                );
++                if (status === "archived") {
++                    await waitForArchived(world, workspace.id, 10_000);
++                    expect(removeWorktree).not.toHaveBeenCalled();
++                } else {
++                    await vi.waitFor(() => expect(incompleteListings).toBeGreaterThan(1), {
++                        timeout: 10_000,
++                    });
++                    expect((await world.workspaces.get(world.ctx, workspace.id))?.status).toBe(
++                        status,
++                    );
++                }
++
++                expect(runGit.mock.calls.map(([, args]) => args.slice(0, 2))).not.toContainEqual([
++                    "worktree",
++                    "prune",
++                ]);
++                expect(await git(repository, ["worktree", "list", "--porcelain", "-z"])).toBe(
++                    registryBefore,
++                );
++                expect(await readdir(workspace.path)).toEqual(["nested"]);
++                expect(await readdir(join(workspace.path, "nested"))).toEqual(["öğrenci.txt"]);
++                expect(await readFile(file)).toEqual(content);
++                expect(await stat(workspace.path)).toMatchObject({
++                    ino: directoryBefore.ino,
++                    mtimeMs: directoryBefore.mtimeMs,
++                });
++                expect(await stat(file)).toMatchObject({
++                    ino: fileBefore.ino,
++                    mtimeMs: fileBefore.mtimeMs,
++                });
++            } finally {
++                world.durableFunctions.stop();
++                world.database.close();
++            }
++        },
++        20_000,
++    );
++
+     it("recovers cancellation checkpoints by agent identity after attachments are reordered", async () => {
+         const world = await archivingCatalog("workspace-archive-agent-checkpoints");
+         let restarted: DurableFunctionsModule | undefined;
+@@ -497,8 +599,12 @@ describe("archiving stops the work standing in a workspace", () => {
+ async function waitForArchived(
+     world: Awaited<ReturnType<typeof archivingCatalog>>,
+     workspaceId: string,
++    timeout?: number,
+ ): Promise<void> {
+-    await vi.waitFor(async () => {
+-        expect((await world.workspaces.get(world.ctx, workspaceId))?.status).toBe("archived");
+-    });
++    await vi.waitFor(
++        async () => {
++            expect((await world.workspaces.get(world.ctx, workspaceId))?.status).toBe("archived");
++        },
++        { timeout },
++    );
+ }

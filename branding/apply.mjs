@@ -91,6 +91,9 @@ export function apply(platform, directory) {
   const windowsUnicode = join(here, 'windows-unicode.patch');
   execFileSync('git', ['-C', root, 'apply', '--check', windowsUnicode]);
   execFileSync('git', ['-C', root, 'apply', windowsUnicode]);
+  const workspaceArchive = join(here, 'workspace-archive.patch');
+  execFileSync('git', ['-C', root, 'apply', '--check', workspaceArchive]);
+  execFileSync('git', ['-C', root, 'apply', workspaceArchive]);
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
