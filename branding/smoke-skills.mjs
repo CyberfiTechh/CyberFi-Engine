@@ -64,6 +64,9 @@ await mkdir(dirname(unrelated), { recursive: true });
 await writeFile(unrelated, 'UNRELATED_PRIVATE_SENTINEL');
 const mcpConfig = join(root, process.platform === 'darwin' ? 'Happy/Config' : 'happy/config', 'mcp.toml');
 await mkdir(dirname(mcpConfig), { recursive: true });
+if (windows) await writeFile(join(dirname(mcpConfig), 'happy.toml'),
+    '[skills]\ndirectories = ' + JSON.stringify([dirname(role)]) + '\n');
+
 const mcpFixture = fileURLToPath(new URL('../../happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs', import.meta.url));
 await writeFile(mcpConfig, `[mcp_servers.math_core]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([mcpFixture, 'owned-native'])}\nstartup_timeout_sec = 15\ntool_timeout_sec = 15\n\n` + deepMcpConfig);
 
@@ -204,7 +207,7 @@ try {
     await wait(async () => (await client.getHealth()).ready);
     const parent = (await client.createBot({ name: 'Owned native skill smoke' })).bot.agent.id;
     const read = await request(parent, { name: 'read_skill', arguments: { name: 'owned-review' } });
-    assert.equal(read.status, 'completed'); assert(output(read).includes('OWNED_ROLE_INSTRUCTIONS'));
+    assert.equal(read.status, 'completed', 'Owned role read failed: ' + String(output(read)).slice(0, 1000)); assert(output(read).includes('OWNED_ROLE_INSTRUCTIONS'));
     const reference = await shellRead(parent, support);
     assert(reference.includes('OWNED_SUPPORT_SENTINEL'), 'Restricted parent support read failed: ' + reference);
     const { project } = await client.createProject({ path: externalProject });

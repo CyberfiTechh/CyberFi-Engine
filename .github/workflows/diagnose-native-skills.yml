@@ -1,4 +1,4 @@
-name: Diagnose native skill candidate
+name: Diagnose the exact CyberFi Windows candidate
 on:
     workflow_dispatch:
 permissions:
@@ -6,36 +6,59 @@ permissions:
     actions: read
 jobs:
     diagnose:
-        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/codex/cyberfi-121-native-smoke'
         runs-on: windows-2025
-        timeout-minutes: 15
+        timeout-minutes: 20
         steps:
-            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
               with:
+                  repository: slopus/happy-agent
+                  ref: 3d672e414d70804cf9f1b20b44d7243c78e063c3
                   persist-credentials: false
-            - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+              with:
+                  path: cyberfi-overlay
+                  persist-credentials: false
+            - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
               with:
                   node-version: '24'
-            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+            - name: Verify exact source run and retained official artifact pins
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  $headers = @{Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'}
+                  $base = 'https://api.github.com/repos/CyberfiTechh/CyberFi-Engine/actions'
+                  $run = Invoke-RestMethod "$base/runs/42580614975" -Headers $headers -TimeoutSec 20
+                  if ($run.head_sha -ne '02a0893b1e9438574bca753825fda20509bd7c29' -or $run.conclusion -ne 'failure') { throw 'Candidate run identity mismatch' }
+                  $artifact = Invoke-RestMethod "$base/artifacts/13656594028" -Headers $headers -TimeoutSec 20
+                  $sandbox = Invoke-RestMethod "$base/artifacts/13656962212" -Headers $headers -TimeoutSec 20
+                  if ($artifact.workflow_run.id -ne $run.id -or $artifact.digest -ne 'sha256:b8893e6243f57c3e72893d621ebb9dcd065349f188f84579b07f6b4e093250a9' -or $sandbox.workflow_run.id -ne $run.id -or $sandbox.digest -ne 'sha256:5993489817e2ec8f4f26f9588797db40d772ddd20a741ebf8b626c8e3ba1fe2c') { throw 'Candidate artifact pin mismatch' }
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
               with:
                   name: cyberfi-engine-candidate-win32-x64
                   repository: CyberfiTechh/CyberFi-Engine
-                  run-id: 42428990185
+                  run-id: 42580614975
                   github-token: ${{ github.token }}
                   path: candidate
-            - name: Verify exact candidate and prepare disposable native boundary
-              shell: pwsh
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+              with:
+                  name: windows-native-sandbox
+                  repository: CyberfiTechh/CyberFi-Engine
+                  run-id: 42580614975
+                  github-token: ${{ github.token }}
+            - name: Prepare disposable native Windows boundary and staged fixtures
               run: |
-                  if ($env:GITHUB_REPOSITORY -ne 'CyberfiTechh/CyberFi-Engine' -or $env:GITHUB_ACTIONS -ne 'true') { throw 'Wrong execution surface' }
+                  node cyberfi-overlay/branding/apply.mjs win32 .
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   $binary = (Resolve-Path candidate/happy-agent-win32-x64.exe).Path
-                  if ((Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne '0eafde5a059bdaacae4cc99000a2dee4d6c3bc14397a1b957c2e5e4207ea0177') { throw 'Candidate SHA mismatch' }
+                  if ((& $binary --version) -ne 'Happy Agent 0.4.121-preview.1') { throw 'Candidate version mismatch' }
                   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
                   if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Ephemeral runner must already be elevated' }
                   & $binary sandbox setup
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                  $status = (& $binary sandbox status) -join "`n"
-                  if ($LASTEXITCODE -ne 0 -or $status -notmatch '(?m)^State directory: (.+)$') { throw 'Missing sandbox state' }
-                  "HAPPY_WINDOWS_SANDBOX_HOME=$($Matches[1].Trim())" >> $env:GITHUB_ENV
+                  $status = & packages/happy-agent-supervisor/native/target/release/happy-agent-supervisor.exe --setup-status | ConvertFrom-Json
+                  if ($LASTEXITCODE -ne 0 -or -not $status.ready) { throw 'Sandbox setup did not complete' }
+                  "HAPPY_WINDOWS_SANDBOX_HOME=$($status.stateDirectory)" >> $env:GITHUB_ENV
                   'HAPPY_WINDOWS_SANDBOX_NO_PROVISION=1' >> $env:GITHUB_ENV
-            - name: Observe actual restricted skill and support access
-              run: node branding/smoke-skills.mjs candidate/happy-agent-win32-x64.exe
+            - name: Observe full native smoke in the exact compiled candidate
+              run: node packages/happy-agent/scripts/cyberfi-smoke-skills.mjs candidate/happy-agent-win32-x64.exe
