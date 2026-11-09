@@ -7,18 +7,18 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-windows-engine-0.4.121-preview.1
+    group: cyberfi-windows-unicode-candidate
     cancel-in-progress: false
 
 jobs:
     windows:
-        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/codex/cyberfi-windows-unicode'
         uses: ./.github/workflows/build-windows.yml
         permissions:
             contents: read
             id-token: write
         with:
-            version: "0.4.121-preview.1"
+            version: "0.4.122-preview.1"
 
     publish:
         if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
