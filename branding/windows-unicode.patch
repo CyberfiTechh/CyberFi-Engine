@@ -72,7 +72,7 @@ index 72c2b0e..6372c57 100644
 -    const raw = await compute.fs.readFile(permissions, filePath);
 +    const bytes = await compute.fs.readFileBuffer(permissions, filePath);
 +    const encoding = options.encoding ?? bomEncoding(bytes);
-+    let decoder: TextDecoder;
++    let decoder: InstanceType<typeof TextDecoder>;
 +    try {
 +        decoder = new TextDecoder(encoding, { fatal: true });
 +    } catch {
