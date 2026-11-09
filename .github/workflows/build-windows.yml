@@ -265,6 +265,33 @@ jobs:
               run: pnpm --filter @slopus/happy-agent-supervisor test:native:windows
             - name: Verify both halves of the runner protocol on Windows
               run: pnpm --filter @slopus/happy-agent-compute exec vitest run tests/runner tests/processes/impl/shellCommandArgs.test.ts tests/host/createHostShell.test.ts tests/supervisor/createSupervisorCommand.test.ts
+            - name: Verify Windows private ACL setup permits a slow system PowerShell
+              run: pnpm --filter @slopus/happy-agent-compute exec vitest run tests/host/CyberFiPrivateDirectoryTimeout.test.ts --maxWorkers=1
+            - name: Verify the compiled engine starts from an empty Windows home
+              timeout-minutes: 3
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $binary = (Resolve-Path -LiteralPath 'packages/happy-agent/dist/bin/happy-agent-win32-x64.exe').Path
+                  $runnerTemp = Get-Item -LiteralPath $env:RUNNER_TEMP
+                  if ($env:GITHUB_ACTIONS -ne 'true' -or -not $runnerTemp.PSIsContainer -or ($runnerTemp.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                      throw 'This cold-start check requires an isolated CI runner'
+                  }
+                  if ($env:HAPPY_AGENT_SERVER_SOCKET_PATH -or $env:HAPPY_AGENT_SERVER_TOKEN_PATH) { throw 'An external daemon is configured' }
+                  $fixture = Join-Path $runnerTemp.FullName ('cyberfi-engine-cold-' + [Guid]::NewGuid().ToString('N'))
+                  if (Test-Path -LiteralPath $fixture) { throw 'The cold-start home is not empty' }
+                  $env:HAPPY_HOME_DIR = $fixture
+                  try {
+                      $clock = [Diagnostics.Stopwatch]::StartNew()
+                      $start = & $binary reload
+                      $elapsed = $clock.ElapsedMilliseconds
+                      if ($LASTEXITCODE -ne 0 -or -not ($start -match '^Daemon is running at ')) { throw 'Cold engine reload did not become ready' }
+                      $status = & $binary status
+                      if ($LASTEXITCODE -ne 0 -or -not ($status -match '^Daemon is running at ')) { throw 'Cold engine is not answering health' }
+                      @{ freshWindowsHome = $true; coldReloadReady = $true; reloadMs = $elapsed; desktopStartupBudgetMs = 75000 } | ConvertTo-Json -Compress
+                      if ($elapsed -ge 75000) { throw 'Cold engine reload exceeded the packaged desktop startup budget' }
+                  } finally {
+                      if (Test-Path -LiteralPath $fixture -PathType Container) { & $binary stop | Out-Null }
+                  }
             - name: Exercise the packaged executable
               run: |
                   $binary = 'packages/happy-agent/dist/bin/happy-agent-win32-x64.exe'

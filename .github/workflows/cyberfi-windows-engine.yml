@@ -7,7 +7,7 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-windows-engine-0.4.123
+    group: cyberfi-windows-engine-0.4.124
     cancel-in-progress: false
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
             contents: read
             id-token: write
         with:
-            version: "0.4.123"
+            version: "0.4.124"
 
     publish:
         if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.event.repository.private == false && github.ref == 'refs/heads/main'
@@ -37,10 +37,10 @@ jobs:
               run: |
                   set -euo pipefail
                   cd release-assets
-                  sha256sum -c happy-agent-0.4.123-win32-x64.tar.gz.sha256
+                  sha256sum -c happy-agent-0.4.124-win32-x64.tar.gz.sha256
                   gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > release-catalog.json
-                  jq -e '[.[][] | select(.tag_name == "v0.4.123")] | length == 0' release-catalog.json > /dev/null
-                  gh release create v0.4.123 --repo "$GITHUB_REPOSITORY" \
-                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.123" \
-                    --notes $'## Düzeltmeler\n- Windows PowerShell ve Python borularında Unicode metin ve dosya yolları korunur. Metin okuma UTF-8, BOM işaretli UTF-16 ve açıkça seçilen eski kodlamaları destekler.\n- Git kaydı artık bulunmayan çalışma alanları, klasör ve dosyalar korunarak arşivlenir.\n\nKaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Üç yerel mimari doğrulaması tamamlanana kadar taslak tutulur.' \
-                    happy-agent-0.4.123-win32-x64.tar.gz happy-agent-0.4.123-win32-x64.tar.gz.sha256
+                  jq -e '[.[][] | select(.tag_name == "v0.4.124")] | length == 0' release-catalog.json > /dev/null
+                  gh release create v0.4.124 --repo "$GITHUB_REPOSITORY" \
+                    --draft --latest=false --target "$GITHUB_SHA" --title "CyberFi Engine 0.4.124" \
+                    --notes $'## Düzeltmeler\n- Windows’ta ilk kurulumda klasör izinlerini ayarlayan PowerShell komutuna 60 saniye tanınır. Mevcut korumalar aynen uygulanır.\n- Windows PowerShell ve Python borularında Unicode metin ve dosya yolları korunur. Metin okuma UTF-8, BOM işaretli UTF-16 ve açıkça seçilen eski kodlamaları destekler.\n- Git kaydı artık bulunmayan çalışma alanları, klasör ve dosyalar korunarak arşivlenir.\n\nKaynak: Happy Agent v0.4.114 (MIT), 3d672e414d70804cf9f1b20b44d7243c78e063c3. Üç yerel mimari doğrulaması tamamlanana kadar taslak tutulur.' \
+                    happy-agent-0.4.124-win32-x64.tar.gz happy-agent-0.4.124-win32-x64.tar.gz.sha256

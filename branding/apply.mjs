@@ -74,7 +74,7 @@ enum StatusIcon {
 ${animation}`;
 }
 export function apply(platform, directory) {
-  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.123';
+  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.124';
   if (releaseVersion.trim() !== releaseVersion || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-preview\.(0|[1-9]\d*))?$/.test(releaseVersion) || releaseVersion.split('-')[0].split('.').some(part => Number(part) > 65535)) throw Error('Invalid native engine release version');
   const assemblyVersion = releaseVersion.split('-')[0] + '.0';
   const root = resolve(directory);
@@ -96,6 +96,12 @@ export function apply(platform, directory) {
   execFileSync('git', ['-C', root, 'apply', workspaceArchive]);
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
+  if (platform === 'win32') {
+    const privatePaths = join(root, 'packages/happy-agent-compute/sources/host/localAgentPaths.ts');
+    const privateText = readFileSync(privatePaths, 'utf8').replaceAll('\r\n', '\n');
+    changes.push([privatePaths, replace(privateText, '            timeout: 15_000,', '            timeout: 60_000,', privatePaths)]);
+    changes.push([join(root, 'packages/happy-agent-compute/tests/host/CyberFiPrivateDirectoryTimeout.test.ts'), readFileSync(join(here, 'PrivateDirectoryTimeout.test.ts'), 'utf8')]);
+  }
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');
   let computeText = replace(readFileSync(computePolicy, 'utf8').replaceAll('\r\n', '\n'), 'import type { PlatformPath } from "node:path";', 'import { isAbsolute, parse, relative, sep, type PlatformPath } from "node:path";\nimport { realpathSync, statSync } from "node:fs";', computePolicy);
   computeText = replace(computeText, 'import { realpathSync, statSync } from "node:fs";', 'import { realpathSync, statSync } from "node:fs";\nimport { cyberFiCommandToolReadDirectories } from "./cyberfiCommandToolReadPolicy.js";', computePolicy);
