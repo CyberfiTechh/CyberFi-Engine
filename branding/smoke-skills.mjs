@@ -216,6 +216,24 @@ try {
         assert(output(restrictedRg).includes('Process exited with code 0'), 'Restricted native ripgrep failed outside the home');
         const deniedOutside = await shellRead(externalAgent.id, unrelated);
         assert(!deniedOutside.includes('UNRELATED_PRIVATE_SENTINEL'), 'External workspace obtained unrelated private data');
+        const managedRg = JSON.parse(commandTools.HAPPY_AGENT_COMMAND_TOOL_READ_PATHS)[1];
+        const supervisor = resolve('packages/happy-agent-supervisor/native/target/release/happy-agent-supervisor.exe');
+        const state = process.env.HAPPY_WINDOWS_SANDBOX_HOME;
+        assert(typeof state === 'string' && isAbsolute(state), 'Owned native Windows sandbox state required');
+        const marker = 'NARROWER_DENY_MUST_NOT_START_PROCESS';
+        for (const deniedPath of [dirname(managedRg), join(managedRg, 'rg.exe')]) {
+            const policy = { mode: 'read_only', allowedReadPaths: [], deniedReadPaths: [profile, deniedPath], network: { egress: false, localBinding: false } };
+            const refusal = spawnSync(supervisor, ['--policy', JSON.stringify(policy), '--state-dir', state, '--cwd', externalProject, '--',
+                join(process.env.SystemRoot, 'System32/cmd.exe'), '/d', '/c', 'echo ' + marker],
+                { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+            assert.equal(refusal.status, 125);
+            assert.match(refusal.stderr, /restricted command refused: a read denial overlaps a CyberFi command runtime/u);
+            assert(!refusal.stdout.includes(marker), 'Narrower deny started a process after an earlier grant');
+        }
+        const allowedAgain = await request(externalAgent.id, { name: 'exec_command', arguments: { cmd: rgCommand(), yield_time_ms: 30000 } });
+        assert.equal(allowedAgain.status, 'completed');
+        assert.match(output(allowedAgain), /ripgrep 15[.]2[.]0/u);
+
     }
     const denied = await shellRead(parent, unrelated);
     assert(!denied.includes('UNRELATED_PRIVATE_SENTINEL'), 'Unrelated private file exposed');
@@ -288,7 +306,7 @@ try {
     }
     assert.equal(await readFile(support, 'utf8'), 'OWNED_SUPPORT_SENTINEL');
     assert.equal(await readFile(unrelated, 'utf8'), 'UNRELATED_PRIVATE_SENTINEL');
-    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, fullAccessChildAndGrandchild: true, nativeFullAccessChildShellAndMcp: true, existingChildFullShellAndMcp: true, realRipgrepMainAndDescendants: true, windowsRestrictedOutsideHome: windows, deepMcpListedAndCalledMain: 31, deepMcpListedAndCalledChild: 31, mcpBackendFixture: true, paidInference: false }));
+    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, fullAccessChildAndGrandchild: true, nativeFullAccessChildShellAndMcp: true, existingChildFullShellAndMcp: true, realRipgrepMainAndDescendants: true, windowsRestrictedOutsideHome: windows, windowsNarrowerDenyAfterWarm: windows, deepMcpListedAndCalledMain: 31, deepMcpListedAndCalledChild: 31, mcpBackendFixture: true, paidInference: false }));
 } catch (error) {
     if (process.platform === 'win32') {
         const paths = [root, join(root, '.agents'), join(root, '.agents', 'skills'), role, support];

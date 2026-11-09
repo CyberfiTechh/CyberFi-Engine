@@ -1,17 +1,43 @@
 diff --git a/packages/happy-agent-supervisor/native/windows/happy.patch b/packages/happy-agent-supervisor/native/windows/happy.patch
-index 28f3d48..0e6f29e 100644
+index 28f3d48..a5f2360 100644
 --- a/packages/happy-agent-supervisor/native/windows/happy.patch
 +++ b/packages/happy-agent-supervisor/native/windows/happy.patch
-@@ -2342,7 +2342,7 @@ index f2524fa..4365444 100644
+@@ -2090,7 +2090,7 @@ index 7532d19..e32e2d6 100644
+      }
+  }
+ diff --git a/codex-rs/windows-sandbox-rs/src/identity.rs b/codex-rs/windows-sandbox-rs/src/identity.rs
+-index 6f3a66d..ab723fb 100644
++index 6f3a66d..79f2406 100644
+ --- a/codex-rs/windows-sandbox-rs/src/identity.rs
+ +++ b/codex-rs/windows-sandbox-rs/src/identity.rs
+ @@ -73,6 +73,36 @@ pub fn sandbox_setup_is_complete_with_settings(
+@@ -2130,7 +2130,15 @@ index 6f3a66d..ab723fb 100644
+  fn load_marker(codex_home: &Path) -> Result<Option<SetupMarker>> {
+      let path = setup_marker_path(codex_home);
+      let marker = match fs::read_to_string(&path) {
+-@@ -383,16 +413,75 @@ pub(crate) fn refresh_logon_sandbox_creds(
++@@ -182,6 +212,7 @@ pub fn require_logon_sandbox_creds(
++     proxy_enforced: bool,
++     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
++ ) -> Result<SandboxCreds> {
+++    crate::setup::verify_managed_command_deny_paths(deny_read_paths_override)?;
++     require_logon_sandbox_creds_with_setup(
++         permissions,
++         command_cwd,
++@@ -383,16 +414,75 @@ pub(crate) fn refresh_logon_sandbox_creds(
+  #[cfg(test)]
+  mod tests {
+      use super::desired_offline_proxy_settings;
+@@ -2342,7 +2350,7 @@ index f2524fa..4365444 100644
   /// Versioned provisioning-service message carried in a length-prefixed JSON frame.
   #[derive(Debug, Serialize, Deserialize, Clone)]
  diff --git a/codex-rs/windows-sandbox-rs/src/setup.rs b/codex-rs/windows-sandbox-rs/src/setup.rs
 -index 1e84b6f..1e55468 100644
-+index 1e84b6f..b5a3fd4 100644
++index 1e84b6f..3170e99 100644
  --- a/codex-rs/windows-sandbox-rs/src/setup.rs
  +++ b/codex-rs/windows-sandbox-rs/src/setup.rs
  @@ -33,6 +33,8 @@ use crate::setup_error::extract_failure;
-@@ -2419,7 +2419,7 @@ index 1e84b6f..1e55468 100644
+@@ -2419,7 +2427,7 @@ index 1e84b6f..1e55468 100644
           if !status.success() {
               return Err(report_helper_failure(
                   codex_home,
@@ -20,7 +46,7 @@ index 28f3d48..0e6f29e 100644
       // Hide the window for the elevated helper.
       sei.nShow = 0; // SW_HIDE
       let ok = unsafe { ShellExecuteExW(&mut sei) };
-@@ -2428,7 +2428,7 @@ index 1e84b6f..1e55468 100644
+@@ -2428,7 +2436,7 @@ index 1e84b6f..1e55468 100644
           let last_error = unsafe { GetLastError() };
           let code = if last_error == ERROR_CANCELLED {
               SetupErrorCode::OrchestratorHelperLaunchCanceled
@@ -29,7 +55,7 @@ index 28f3d48..0e6f29e 100644
               format!("ShellExecuteExW failed to launch setup helper: {last_error}"),
           ));
       }
-@@ -2445,7 +2445,7 @@ index 1e84b6f..1e55468 100644
+@@ -2445,7 +2453,7 @@ index 1e84b6f..1e55468 100644
           let mut code: u32 = 1;
           GetExitCodeProcess(sei.hProcess, &mut code);
           CloseHandle(sei.hProcess);
@@ -38,7 +64,7 @@ index 28f3d48..0e6f29e 100644
   }
   
   pub fn run_elevated_setup(request: SandboxSetupRequest<'_>) -> Result<()> {
-@@ -2546,7 +2546,7 @@ index 1e84b6f..1e55468 100644
+@@ -2546,7 +2554,7 @@ index 1e84b6f..1e55468 100644
           version: SETUP_VERSION,
           offline_username: OFFLINE_USERNAME.to_string(),
           online_username: ONLINE_USERNAME.to_string(),
@@ -47,24 +73,23 @@ index 28f3d48..0e6f29e 100644
           deny_write_paths: Vec::new(),
           proxy_ports: offline_proxy_settings.proxy_ports,
           allow_local_binding: offline_proxy_settings.allow_local_binding,
-@@ -2560,7 +2560,81 @@ index 1e84b6f..1e55468 100644
+@@ -2560,7 +2568,124 @@ index 1e84b6f..1e55468 100644
   }
   
   pub fn run_elevated_provisioning_setup(
 -@@ -1600,7 +1646,7 @@ mod tests {
-+@@ -1221,6 +1271,11 @@ pub(crate) fn build_payload_roots(
++@@ -1221,6 +1271,10 @@ pub(crate) fn build_payload_roots(
 +         .iter()
 +         .map(|path| canonical_path_key(path))
 +         .collect();
 ++    let managed_profile = overrides
 ++        .read_roots
 ++        .as_ref()
-++        .and_then(|_| crate::happy_setup_gate::default_state_directory().ok())
-++        .and_then(|state| state.parent()?.parent().map(canonical_path_key));
+++        .and_then(|_| managed_command_profile_key().ok());
 +     read_roots.retain(|root| {
 +         if write_root_set.contains(root) {
 +             return false;
-+@@ -1231,11 +1286,34 @@ pub(crate) fn build_payload_roots(
++@@ -1231,11 +1285,62 @@ pub(crate) fn build_payload_roots(
 +         let root_key = canonical_path_key(root);
 +         !deny_read_keys
 +             .iter()
@@ -74,33 +99,61 @@ index 28f3d48..0e6f29e 100644
 +     (read_roots, write_roots)
 + }
 +
+++const MANAGED_COMMAND_ROOTS: [&str; 2] = [
+++    "/.pdr-kocum-agent/mcp-runtime/runtimes/python-win32-x64/python",
+++    "/.pdr-kocum-agent/mcp-runtime/runtimes/rg-win32-x64/ripgrep-15.2.0-x86_64-pc-windows-msvc",
+++];
+++
+++fn managed_command_profile_key() -> Result<String> {
+++    let state = crate::happy_setup_gate::default_state_directory()?;
+++    let profile = state
+++        .parent()
+++        .and_then(Path::parent)
+++        .context("resolve the real Windows profile")?;
+++    Ok(canonical_path_key(profile))
+++}
+++
+++pub(crate) fn verify_managed_command_deny_paths(denied: &[PathBuf]) -> Result<()> {
+++    if denied.is_empty() {
+++        return Ok(());
+++    }
+++    let profile = managed_command_profile_key()?;
+++    if denied
+++        .iter()
+++        .any(|path| managed_command_deny_conflicts(&profile, &canonical_path_key(path)))
+++    {
+++        return Err(anyhow!(
+++            "restricted command refused: a read denial overlaps a CyberFi command runtime"
+++        ));
+++    }
+++    Ok(())
+++}
+++
+++fn managed_command_deny_conflicts(profile: &str, deny_key: &str) -> bool {
+++    // A previously granted leaf ACL may out-rank a later inherited deny.
+++    deny_key != profile
+++        && MANAGED_COMMAND_ROOTS.iter().any(|relative| {
+++            let root = format!("{profile}{relative}");
+++            Path::new(&root).starts_with(deny_key) || Path::new(deny_key).starts_with(&root)
+++        })
+++}
+++
 ++fn read_root_denied(root_key: &str, denied_key: &str, managed_profile: Option<&str>) -> bool {
 ++    if !Path::new(root_key).starts_with(denied_key) {
 ++        return false;
 ++    }
 ++    // An external workspace denies the whole profile. Keep that deny and
 ++    // let the helper grant only these canonical, explicitly requested tool leaves.
-++    if managed_profile == Some(denied_key) {
-++        let tool = root_key
+++    !(managed_profile == Some(denied_key)
+++        && root_key
 ++            .strip_prefix(denied_key)
-++            .and_then(|path| path.strip_prefix("/.pdr-kocum-agent/mcp-runtime/runtimes/"));
-++        if matches!(
-++            tool,
-++            Some(
-++                "python-win32-x64/python"
-++                    | "rg-win32-x64/ripgrep-15.2.0-x86_64-pc-windows-msvc"
-++            )
-++        ) {
-++            return false;
-++        }
-++    }
-++    true
+++            .is_some_and(|relative| MANAGED_COMMAND_ROOTS.contains(&relative)))
 ++}
 ++
 + pub(crate) fn build_payload_deny_write_paths(
 +     request: &SandboxSetupRequest<'_>,
 +     explicit_deny_write_paths: Option<Vec<PathBuf>>,
-+@@ -1431,6 +1509,25 @@ mod tests {
++@@ -1431,6 +1536,41 @@ mod tests {
 +     use std::time::Instant;
 +     use tempfile::TempDir;
 +
@@ -123,19 +176,35 @@ index 28f3d48..0e6f29e 100644
 ++        assert!(super::read_root_denied("c:/users/owner/.ssh", profile, Some(profile)));
 ++    }
 ++
+++    #[test]
+++    fn managed_command_read_roots_refuse_overlapping_denials_after_grants() {
+++        let profile = "c:/users/owner";
+++        let base = format!("{profile}/.pdr-kocum-agent/mcp-runtime/runtimes");
+++        assert!(!super::managed_command_deny_conflicts(profile, profile));
+++        assert!(super::managed_command_deny_conflicts(profile, "c:/users"));
+++        assert!(super::managed_command_deny_conflicts(profile, &base));
+++        for relative in super::MANAGED_COMMAND_ROOTS {
+++            let root = format!("{profile}{relative}");
+++            assert!(super::managed_command_deny_conflicts(profile, &root));
+++            assert!(super::managed_command_deny_conflicts(profile, &format!("{root}/tool")));
+++            assert!(!super::managed_command_deny_conflicts(profile, &format!("{root}-unrelated")));
+++        }
+++        assert!(!super::managed_command_deny_conflicts(profile, "c:/users/owner/.ssh"));
+++    }
+++
 +     fn canonical_windows_platform_default_roots() -> Vec<PathBuf> {
 +         WINDOWS_PLATFORM_DEFAULT_READ_ROOTS
 +             .iter()
-+@@ -1600,7 +1697,7 @@ mod tests {
++@@ -1600,7 +1740,7 @@ mod tests {
   
           let payload = super::elevated_provisioning_payload(
               &request, /*offline_proxy_settings_override*/ None,
-@@ -2569,7 +2643,7 @@ index 1e84b6f..1e55468 100644
+@@ -2569,7 +2694,7 @@ index 1e84b6f..1e55468 100644
   
           assert_eq!(payload.command_cwd, codex_home);
           assert_eq!(payload.read_roots, Vec::<PathBuf>::new());
 -@@ -1870,7 +1916,7 @@ mod tests {
-+@@ -1870,7 +1967,7 @@ mod tests {
++@@ -1870,7 +2010,7 @@ mod tests {
           fs::create_dir_all(&bin_dir).expect("create bin dir");
           fs::create_dir_all(&resources_dir).expect("create resources dir");
           let exe = bin_dir.join("codex.exe");
