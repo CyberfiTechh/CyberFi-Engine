@@ -236,6 +236,7 @@ try {
         const allowedAgain = await request(externalAgent.id, { name: 'exec_command', arguments: { cmd: rgCommand(), yield_time_ms: 30000 } });
         assert.equal(allowedAgain.status, 'completed');
         assert.match(output(allowedAgain), /ripgrep 15[.]2[.]0/u);
+        console.log('Owned Windows external restricted ripgrep and warm narrower denials passed.');
 
     }
     const denied = await shellRead(parent, unrelated);
@@ -267,7 +268,7 @@ try {
             assert.equal(shell.status, 'completed'); assert(output(shell).includes(sentinel));
             assert(shellCalls.some(tool => output(tool).includes('ripgrep 15.2.0')), 'Native ripgrep result missing');
             if (!shellCalls.some(tool => output(tool).includes('Process exited with code 0'))) return undefined;
-            assert.equal(mcp.status, 'completed'); assert(output(mcp).includes('owned-native:' + sentinel + '_MCP'));
+            assert.equal(mcp.status, 'completed', 'Owned child MCP failed: ' + String(output(mcp)).slice(0, 1500)); assert(output(mcp).includes('owned-native:' + sentinel + '_MCP'));
             if (!nested) return true;
             const listings = calls.filter(tool => tool.name === 'list_mcp_tools' && tool.status !== 'running');
             const finished = calls.filter(tool => tool.name === 'call_mcp_tool' && tool.status === 'completed');
@@ -299,7 +300,7 @@ try {
         assert(output(result).includes(deepMcpMarker(call.arguments)), 'Missing main-agent MCP dispatch: ' + call.arguments.name);
     }
     const catalog = await request(parent, { name: 'list_mcp_tools', arguments: { server: 'Math Core' } }, 'full_access');
-    assert.equal(catalog.status, 'completed'); assert(output(catalog).includes('echo'), 'Native MCP display alias did not resolve');
+    assert.equal(catalog.status, 'completed', 'Owned parent MCP list failed: ' + String(output(catalog)).slice(0, 1500)); assert(output(catalog).includes('echo'), 'Native MCP display alias did not resolve');
     const echo = await request(parent, { name: 'call_mcp_tool', arguments: { server: 'Math Core', name: 'echo', arguments: { text: 'NATIVE_ALIAS_SENTINEL' } } }, 'full_access');
     assert.equal(echo.status, 'completed'); assert(output(echo).includes('owned-native:NATIVE_ALIAS_SENTINEL'), 'Native MCP alias tool invocation failed');
     for (const name of ['grok_web_search', 'bedrock_web_search']) {
