@@ -1,0 +1,84 @@
+name: Verify published macOS archive fix
+
+on:
+  push:
+    branches: [codex/mac-archive-acceptance]
+    paths:
+      - .github/workflows/verify-macos-archive.yml
+      - tests/archive-native-macos.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: Archive orphan worktree (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: darwin-arm64
+            architecture: arm64
+            bytes: 193764762
+            sha256: dcfdd8ff878176b35e89951741080426a8a852b915093865707ad4b69b90b361
+            sidecar_sha256: 38d4929186ec4ea1beb6969b61926eb97cef8587e885b5e033b5c309a654da50
+          - runner: macos-15-intel
+            target: darwin-x64
+            architecture: x86_64
+            bytes: 204619903
+            sha256: 873ad5cad6e4738403b086b0b2a7b16da8de7fb83cdfabe55d6b9084ad7cd269
+            sidecar_sha256: a7661819f06f91c7f00cdbb2603fef79be573117e01474b3c7b86652f3c1c563
+    env:
+      ENGINE_VERSION: 0.4.123-preview.1
+      TARGET: ${{ matrix.target }}
+      TARGET_ARCH: ${{ matrix.architecture }}
+      ASSET_SIZE: ${{ matrix.bytes }}
+      ASSET_SHA: ${{ matrix.sha256 }}
+      SIDECAR_SHA: ${{ matrix.sidecar_sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install exact public engine package and verify its signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$TARGET_ARCH"
+          archive="happy-agent-$ENGINE_VERSION-$TARGET.tar.gz"
+          base="https://github.com/CyberfiTechh/CyberFi-Engine/releases/download/v$ENGINE_VERSION"
+          stage="$(mktemp -d "$RUNNER_TEMP/cyberfi-engine-install.XXXXXXXX")"
+          cd "$stage"
+          curl --fail --silent --show-error --location --retry 3 --max-time 240 "$base/$archive" -o "$archive"
+          curl --fail --silent --show-error --location --retry 3 --max-time 30 "$base/$archive.sha256" -o "$archive.sha256"
+          test "$(stat -f %z "$archive")" = "$ASSET_SIZE"
+          test "$(shasum -a 256 "$archive" | cut -d ' ' -f 1)" = "$ASSET_SHA"
+          test "$(shasum -a 256 "$archive.sha256" | cut -d ' ' -f 1)" = "$SIDECAR_SHA"
+          test "$(tar -tzf "$archive")" = "happy-agent-$TARGET"
+          install_dir="$stage/profile/.happy/dist/version/$ENGINE_VERSION"
+          mkdir -p "$install_dir"
+          binary="$install_dir/happy-agent"
+          tar -xOzf "$archive" "happy-agent-$TARGET" > "$binary"
+          chmod 755 "$binary"
+          test "$(lipo -archs "$binary")" = "$TARGET_ARCH"
+          codesign --verify --strict "$binary"
+          printf 'INSTALLED_ENGINE=%s\n' "$binary" >> "$GITHUB_ENV"
+          printf '%s\n' "$ASSET_SHA" > "$RUNNER_TEMP/archive-package-sha256.txt"
+      - name: Archive a Git-unregistered workspace without changing files
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/archive-native-macos.mjs "$INSTALLED_ENGINE" "$ENGINE_VERSION" archived | tee "$RUNNER_TEMP/archive-native-proof.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: archive-proof-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/archive-package-sha256.txt
+            ${{ runner.temp }}/archive-native-proof.json
+          if-no-files-found: error
