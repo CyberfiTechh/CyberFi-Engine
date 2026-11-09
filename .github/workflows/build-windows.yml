@@ -31,6 +31,10 @@ jobs:
                       script: packages/happy-agent/scripts/build-native-libsql.mjs
                       source: packages/happy-agent/native/libsql/**
                       output: packages/happy-agent/native/target/win32-x64
+                    - component: sandbox
+                      script: packages/happy-agent-supervisor/scripts/build-native-windows.mjs
+                      source: packages/happy-agent-supervisor/native/windows/**
+                      output: packages/happy-agent-supervisor/native/target/release
         steps:
             - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
@@ -41,6 +45,19 @@ jobs:
               with:
                   node-version: "24"
                   package-manager-cache: false
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              if: matrix.component == 'sandbox'
+              with:
+                  path: cyberfi-overlay
+                  persist-credentials: false
+            - name: Apply CyberFi changes to the pinned native sandbox patch
+              if: matrix.component == 'sandbox'
+              run: |
+                  $patch = 'cyberfi-overlay/branding/windows-managed-command-tools.patch'
+                  git apply --check $patch
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  git apply $patch
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Cache native outputs by pinned source and builder
               id: native-cache
               uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -48,7 +65,7 @@ jobs:
                   path: ${{ matrix.output }}
                   # Bump the cache version when changing the compiler setup below. Package-only
                   # changes reuse native outputs; every run still tests the final binary.
-                  key: windows-gnu-rust195-v2-${{ matrix.component }}-${{ hashFiles('.gitattributes', matrix.source, matrix.script, 'packages/happy-agent/scripts/assertWindowsSystemImports.mjs') }}
+                  key: windows-gnu-rust195-v2-${{ matrix.component }}-${{ hashFiles('.gitattributes', matrix.source, matrix.script, 'packages/happy-agent/scripts/assertWindowsSystemImports.mjs', 'cyberfi-overlay/branding/windows-managed-command-tools.patch') }}
             - name: Install GNU native build tools
               if: steps.native-cache.outputs.cache-hit != 'true'
               id: msys2
@@ -147,7 +164,7 @@ jobs:
               run: |
                   node --test cyberfi-overlay/branding/command-tool-read-policy.test.mjs
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/systemPrompt/SystemPromptWindows.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Verify human Full access inheritance and queued human restrictions
               run: |
@@ -159,21 +176,21 @@ jobs:
               run: |
                   pnpm --filter @slopus/happy-agent exec pnpm dlx bun@1.4.4 scripts/verify-windows-sockets.ts
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            - name: Stage the published sandbox SDK for its native regression checks
-              run: |
-                  @'
-                  const { cpSync, mkdirSync } = require('node:fs');
-                  const { createRequire } = require('node:module');
-                  const { dirname, join, resolve } = require('node:path');
-                  const agent = createRequire(resolve('packages/happy-agent/package.json'));
-                  const compute = createRequire(agent.resolve('@slopus/happy-agent-compute'));
-                  const platform = dirname(compute.resolve('@slopus/happy-agent-supervisor-win32-x64/package.json'));
-                  const source = join(platform, 'vendor/x86_64-pc-windows-gnu/bin');
-                  const destination = 'packages/happy-agent-supervisor/native/target/release';
-                  mkdirSync(destination, { recursive: true });
-                  cpSync(source, destination, { recursive: true });
-                  '@ | node
-                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Authenticate signing with GitHub OIDC
+              if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
+              uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+              with:
+                  client-id: ${{ vars.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ vars.AZURE_TENANT_ID }}
+                  subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+            - name: Install the pinned Artifact Signing module
+              if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
+              run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.8 -Force -Repository PSGallery -Scope CurrentUser
+            - name: Sign rebuilt sandbox executables when signing is enabled
+              if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
+              run: ./scripts/sign-windows-files.ps1 -Directory packages/happy-agent-supervisor/native/target/release
+            - name: Stage the rebuilt sandbox for native tests and embedding
+              run: node cyberfi-overlay/branding/stage-windows-sandbox.mjs stage
             - name: Select the built libsql binding for native regression checks
               run: |
                   @'
@@ -192,16 +209,6 @@ jobs:
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Verify voice settings and custom prompt preservation
               run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/liveModule.test.ts tests/config/liveConfiguration.test.ts tests/skills/CyberFiSkillsReadPolicy.test.ts
-            - name: Authenticate signing with GitHub OIDC
-              if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
-              uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
-              with:
-                  client-id: ${{ vars.AZURE_CLIENT_ID }}
-                  tenant-id: ${{ vars.AZURE_TENANT_ID }}
-                  subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-            - name: Install the pinned Artifact Signing module
-              if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
-              run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.8 -Force -Repository PSGallery -Scope CurrentUser
             - name: Verify patched Parcel callback lifetimes under Node and Bun
               run: pnpm --filter @slopus/happy-agent test:native:watcher
 
@@ -219,6 +226,8 @@ jobs:
                   $tray = Get-Item packages/happy-agent-modules/dist/menuBar/bin/happy-menu-bar-win32-x64.exe
                   $expectedFileVersion = ($env:HAPPY_AGENT_RELEASE_VERSION -split '-')[0] + '.0'
                   if ($tray.VersionInfo.ProductName -ne 'CyberFi' -or $tray.VersionInfo.FileVersion -ne $expectedFileVersion -or $tray.VersionInfo.ProductVersion -ne $env:HAPPY_AGENT_RELEASE_VERSION) { throw 'Native tray metadata mismatch' }
+            - name: Verify all rebuilt sandbox hashes in the compiled executable
+              run: node cyberfi-overlay/branding/stage-windows-sandbox.mjs verify
             - name: Sign and verify the standalone executable
               if: env.HAPPY_WINDOWS_SIGNING_ENABLED == 'true'
               run: ./scripts/sign-windows-files.ps1 -Directory packages/happy-agent/dist/bin
@@ -280,6 +289,7 @@ jobs:
                   $hash = (Get-FileHash "release-assets/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
                   "$hash  $name" | Set-Content "release-assets/$name.sha256" -Encoding ascii
                   Copy-Item cyberfi-tray-branding-proof.json "release-assets/$name.branding-proof.json"
+                  Copy-Item cyberfi-windows-sandbox-proof.json "release-assets/$name.sandbox-proof.json"
                   $signing = if ($env:HAPPY_WINDOWS_SIGNING_ENABLED -eq 'true') { 'Signed' } else { 'Unsigned' }
                   "$signing Windows x64 Agent: ``$name`` (SHA-256 ``$hash``)." >> $env:GITHUB_STEP_SUMMARY
             - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

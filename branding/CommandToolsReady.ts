@@ -195,5 +195,15 @@ export function cyberFiCommandToolsEnvironment(
         ...prefix,
         ...(value?.split(delimiter).filter((value) => !prefix.includes(value)) ?? []),
     ].join(delimiter);
+    if (process.platform === "win32") {
+        const isPathExt = ([name]: [string, unknown]) => name.toLowerCase() === "pathext";
+        const override = Object.entries(command ?? {}).find(isPathExt);
+        const original = override ?? Object.entries(environment).find(isPathExt);
+        const extensions = original?.[1];
+        // PowerShell needs .EXE in PATHEXT to find a bare command such as rg.
+        if (extensions !== null && !extensions?.split(";").some((ext) => ext.toUpperCase() === ".EXE")) {
+            result[original?.[0] ?? "PATHEXT"] = extensions ? `${extensions};.EXE` : ".EXE";
+        }
+    }
     return result;
 }

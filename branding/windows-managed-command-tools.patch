@@ -1,0 +1,141 @@
+diff --git a/packages/happy-agent-supervisor/native/windows/happy.patch b/packages/happy-agent-supervisor/native/windows/happy.patch
+index 28f3d48..0e6f29e 100644
+--- a/packages/happy-agent-supervisor/native/windows/happy.patch
++++ b/packages/happy-agent-supervisor/native/windows/happy.patch
+@@ -2342,7 +2342,7 @@ index f2524fa..4365444 100644
+  /// Versioned provisioning-service message carried in a length-prefixed JSON frame.
+  #[derive(Debug, Serialize, Deserialize, Clone)]
+ diff --git a/codex-rs/windows-sandbox-rs/src/setup.rs b/codex-rs/windows-sandbox-rs/src/setup.rs
+-index 1e84b6f..1e55468 100644
++index 1e84b6f..b5a3fd4 100644
+ --- a/codex-rs/windows-sandbox-rs/src/setup.rs
+ +++ b/codex-rs/windows-sandbox-rs/src/setup.rs
+ @@ -33,6 +33,8 @@ use crate::setup_error::extract_failure;
+@@ -2419,7 +2419,7 @@ index 1e84b6f..1e55468 100644
+          if !status.success() {
+              return Err(report_helper_failure(
+                  codex_home,
+-@@ -1004,7 +1008,7 @@ fn run_setup_exe_payload(
++@@ -1004,7 +1012,7 @@ fn run_setup_exe_payload(
+      // Hide the window for the elevated helper.
+      sei.nShow = 0; // SW_HIDE
+      let ok = unsafe { ShellExecuteExW(&mut sei) };
+@@ -2428,7 +2428,7 @@ index 1e84b6f..1e55468 100644
+          let last_error = unsafe { GetLastError() };
+          let code = if last_error == ERROR_CANCELLED {
+              SetupErrorCode::OrchestratorHelperLaunchCanceled
+-@@ -1016,8 +1020,15 @@ fn run_setup_exe_payload(
++@@ -1016,8 +1024,15 @@ fn run_setup_exe_payload(
+              format!("ShellExecuteExW failed to launch setup helper: {last_error}"),
+          ));
+      }
+@@ -2445,7 +2445,7 @@ index 1e84b6f..1e55468 100644
+          let mut code: u32 = 1;
+          GetExitCodeProcess(sei.hProcess, &mut code);
+          CloseHandle(sei.hProcess);
+-@@ -1040,48 +1051,83 @@ fn run_setup_exe_payload(
++@@ -1040,48 +1055,83 @@ fn run_setup_exe_payload(
+  }
+  
+  pub fn run_elevated_setup(request: SandboxSetupRequest<'_>) -> Result<()> {
+@@ -2546,7 +2546,7 @@ index 1e84b6f..1e55468 100644
+          version: SETUP_VERSION,
+          offline_username: OFFLINE_USERNAME.to_string(),
+          online_username: ONLINE_USERNAME.to_string(),
+-@@ -1093,11 +1139,11 @@ fn elevated_provisioning_payload(
++@@ -1093,11 +1143,11 @@ fn elevated_provisioning_payload(
+          deny_write_paths: Vec::new(),
+          proxy_ports: offline_proxy_settings.proxy_ports,
+          allow_local_binding: offline_proxy_settings.allow_local_binding,
+@@ -2560,7 +2560,81 @@ index 1e84b6f..1e55468 100644
+  }
+  
+  pub fn run_elevated_provisioning_setup(
+-@@ -1600,7 +1646,7 @@ mod tests {
++@@ -1221,6 +1271,11 @@ pub(crate) fn build_payload_roots(
++         .iter()
++         .map(|path| canonical_path_key(path))
++         .collect();
+++    let managed_profile = overrides
+++        .read_roots
+++        .as_ref()
+++        .and_then(|_| crate::happy_setup_gate::default_state_directory().ok())
+++        .and_then(|state| state.parent()?.parent().map(canonical_path_key));
++     read_roots.retain(|root| {
++         if write_root_set.contains(root) {
++             return false;
++@@ -1231,11 +1286,34 @@ pub(crate) fn build_payload_roots(
++         let root_key = canonical_path_key(root);
++         !deny_read_keys
++             .iter()
++-            .any(|denied| Path::new(&root_key).starts_with(denied))
+++            .any(|denied| read_root_denied(&root_key, denied, managed_profile.as_deref()))
++     });
++     (read_roots, write_roots)
++ }
++
+++fn read_root_denied(root_key: &str, denied_key: &str, managed_profile: Option<&str>) -> bool {
+++    if !Path::new(root_key).starts_with(denied_key) {
+++        return false;
+++    }
+++    // An external workspace denies the whole profile. Keep that deny and
+++    // let the helper grant only these canonical, explicitly requested tool leaves.
+++    if managed_profile == Some(denied_key) {
+++        let tool = root_key
+++            .strip_prefix(denied_key)
+++            .and_then(|path| path.strip_prefix("/.pdr-kocum-agent/mcp-runtime/runtimes/"));
+++        if matches!(
+++            tool,
+++            Some(
+++                "python-win32-x64/python"
+++                    | "rg-win32-x64/ripgrep-15.2.0-x86_64-pc-windows-msvc"
+++            )
+++        ) {
+++            return false;
+++        }
+++    }
+++    true
+++}
+++
++ pub(crate) fn build_payload_deny_write_paths(
++     request: &SandboxSetupRequest<'_>,
++     explicit_deny_write_paths: Option<Vec<PathBuf>>,
++@@ -1431,6 +1509,25 @@ mod tests {
++     use std::time::Instant;
++     use tempfile::TempDir;
++
+++    #[test]
+++    fn managed_command_read_roots_only_override_the_real_profile_deny() {
+++        let profile = "c:/users/owner";
+++        let base = format!("{profile}/.pdr-kocum-agent/mcp-runtime/runtimes");
+++        let rg = format!("{base}/rg-win32-x64/ripgrep-15.2.0-x86_64-pc-windows-msvc");
+++        let python = format!("{base}/python-win32-x64/python");
+++        for root in [&rg, &python] {
+++            assert!(!super::read_root_denied(root, profile, Some(profile)));
+++            assert!(super::read_root_denied(root, profile, None));
+++            assert!(super::read_root_denied(root, profile, Some("c:/users/other")));
+++            assert!(super::read_root_denied(root, &base, Some(profile)));
+++            assert!(super::read_root_denied(root, root, Some(profile)));
+++        }
+++        assert!(super::read_root_denied(&base, profile, Some(profile)));
+++        assert!(super::read_root_denied(&format!("{rg}-other"), profile, Some(profile)));
+++        assert!(super::read_root_denied(&format!("{rg}/other"), profile, Some(profile)));
+++        assert!(super::read_root_denied("c:/users/owner/.ssh", profile, Some(profile)));
+++    }
+++
++     fn canonical_windows_platform_default_roots() -> Vec<PathBuf> {
++         WINDOWS_PLATFORM_DEFAULT_READ_ROOTS
++             .iter()
++@@ -1600,7 +1697,7 @@ mod tests {
+  
+          let payload = super::elevated_provisioning_payload(
+              &request, /*offline_proxy_settings_override*/ None,
+@@ -2569,7 +2643,7 @@ index 1e84b6f..1e55468 100644
+  
+          assert_eq!(payload.command_cwd, codex_home);
+          assert_eq!(payload.read_roots, Vec::<PathBuf>::new());
+-@@ -1870,7 +1916,7 @@ mod tests {
++@@ -1870,7 +1967,7 @@ mod tests {
+          fs::create_dir_all(&bin_dir).expect("create bin dir");
+          fs::create_dir_all(&resources_dir).expect("create resources dir");
+          let exe = bin_dir.join("codex.exe");

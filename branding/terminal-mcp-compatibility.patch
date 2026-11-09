@@ -1,0 +1,146 @@
+diff --git a/packages/happy-agent-modules/sources/mcp/Mcp.ts b/packages/happy-agent-modules/sources/mcp/Mcp.ts
+--- a/packages/happy-agent-modules/sources/mcp/Mcp.ts
++++ b/packages/happy-agent-modules/sources/mcp/Mcp.ts
+@@ -28,6 +28,7 @@
+ export const MAX_MCP_TEXT_BYTES = 512 * 1024;
+ export const MAX_MCP_UNKNOWN_RESOURCE_BYTES = 4_096;
+ export const MAX_MCP_JSON_DEPTH = 12;
++const MAX_MCP_INPUT_SCHEMA_DEPTH = 32;
+ export const MAX_MCP_JSON_STRING_LENGTH = 1_000_000;
+ export const MAX_MCP_JSON_ARRAY_ITEMS = 2_048;
+ export const MAX_MCP_JSON_OBJECT_PROPERTIES = 2_048;
+@@ -141,7 +142,7 @@
+  */
+ export const mcpInputSchemaSchema = Type.Record(
+     Type.String({ maxLength: MAX_MCP_JSON_KEY_LENGTH }),
+-    mcpJsonValueSchema,
++    jsonValueAtDepth(MAX_MCP_INPUT_SCHEMA_DEPTH - 1),
+     { maxProperties: MAX_MCP_JSON_OBJECT_PROPERTIES },
+ );
+ export type McpInputSchema = Static<typeof mcpInputSchemaSchema>;
+diff --git a/packages/happy-agent-modules/sources/mcp/LEARNINGS.md b/packages/happy-agent-modules/sources/mcp/LEARNINGS.md
+--- a/packages/happy-agent-modules/sources/mcp/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/mcp/LEARNINGS.md
+@@ -60,8 +60,9 @@
+ each listed tool before assembling a page, omit only descriptors that are invalid or outside the
+ bounded protocol shape, and keep the server and its healthy tools connected. Model-facing tool
+ conversion has the same per-tool failure boundary, matching Codex's behavior of logging and
+-skipping a tool whose spec cannot be built. MCP JSON values permit twelve nested collections;
+-deeper values remain excluded so validation work stays finite.
++skipping a tool whose spec cannot be built. Tool input schemas have a separate 32-collection
++bound because schemas for charts and reverse-engineering tools can be deeper than their inputs.
++MCP arguments, results and metadata retain their existing JSON value bound.
+ 
+ ## Bounded JSON schemas serialize compactly
+ 
+diff --git a/packages/happy-agent-modules/tests/mcp/McpToolSerialization.test.ts b/packages/happy-agent-modules/tests/mcp/McpToolSerialization.test.ts
+--- a/packages/happy-agent-modules/tests/mcp/McpToolSerialization.test.ts
++++ b/packages/happy-agent-modules/tests/mcp/McpToolSerialization.test.ts
+@@ -6,6 +6,7 @@
+     createMcpProtocolTools,
+     createMcpTool,
+     mcpJsonValueSchema,
++    mcpToolPageSchema,
+     type McpModule,
+ } from "../../sources/mcp/index.js";
+ 
+@@ -18,6 +19,14 @@
+         value = level % 2 === 0 ? [value] : { key: value };
+     }
+     return value;
++}
++
++function nestedArraySchema(collections: number): Record<string, unknown> {
++    let schema: Record<string, unknown> = { type: "string" };
++    for (let level = 1; level < collections; level++) {
++        schema = { type: "array", items: schema };
++    }
++    return schema;
+ }
+ 
+ describe("MCP tool serialization", () => {
+@@ -38,6 +47,28 @@
+         }
+     });
+ 
++    it("accepts deep input definitions through listing and direct tool construction", () => {
++        const tool = {
++            name: "deep_tool",
++            inputSchema: { type: "object", properties: { items: nestedArraySchema(29) } },
++        };
++        expect(Value.Check(mcpToolPageSchema, { tools: [tool] })).toBe(true);
++        expect(createMcpTool(module, "agent", "server", tool).parameters).toMatchObject(
++            tool.inputSchema,
++        );
++        const deepest = {
++            ...tool,
++            inputSchema: { type: "object", properties: { items: nestedArraySchema(30) } },
++        };
++        expect(Value.Check(mcpToolPageSchema, { tools: [deepest] })).toBe(true);
++        const overLimit = {
++            ...tool,
++            inputSchema: { type: "object", properties: { items: nestedArraySchema(31) } },
++        };
++        expect(Value.Check(mcpToolPageSchema, { tools: [overLimit] })).toBe(false);
++        expect(() => createMcpTool(module, "agent", "server", overLimit)).toThrow();
++    });
++
+     it("still validates the nesting bound the serialized form leaves out", () => {
+         expect(Value.Check(mcpJsonValueSchema, nestedValue(MAX_MCP_JSON_DEPTH))).toBe(true);
+         expect(Value.Check(mcpJsonValueSchema, nestedValue(MAX_MCP_JSON_DEPTH + 1))).toBe(false);
+diff --git a/packages/happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs b/packages/happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs
+--- a/packages/happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs
++++ b/packages/happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs
+@@ -44,15 +44,14 @@
+                       echoTool(),
+                       {
+                           name: "nested",
+-                          description:
+-                              "A valid tool whose schema reaches the supported JSON depth.",
+-                          inputSchema: nestedObjectInputSchema(6),
++                          description: "A valid tool whose schema uses deeply nested JSON.",
++                          inputSchema: nestedObjectInputSchema(15),
+                       },
+                       {
+                           name: "too_deep",
+                           description:
+                               "A broken tool whose schema exceeds the supported JSON depth.",
+-                          inputSchema: nestedObjectInputSchema(7),
++                          inputSchema: nestedObjectInputSchema(16),
+                       },
+                   ]
+                 : label === "elicitation"
+diff --git a/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts b/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
+--- a/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
++++ b/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
+@@ -43,6 +43,7 @@
+             ? [
+                   "- Commands run on native Windows in PowerShell. Use native Windows tools and paths. Bash is available only in a Linux environment such as WSL, not in this native Windows session; do not use Git Bash.",
+                   "- Use PowerShell syntax: $env:NAME = 'value' for environment variables; & 'C:\\Program Files\\tool.exe' for a quoted executable; -LiteralPath for file operations. Separate commands with newlines. PowerShell 5.1 does not support &&, ||, export, or Bash heredocs. Check $LASTEXITCODE after native programs before continuing dependent work.",
++                  "- Run Node package managers through their Windows command shims, for example npm.cmd, npx.cmd, and pnpm.cmd. PowerShell can resolve the bare names to .ps1 wrappers that the current execution policy blocks. Preserve the user's execution policy.",
+                   "- Start background helpers with Start-Process -WindowStyle Hidden unless the user needs a visible window. Keep filesystem operations in one shell and verify the resolved target before recursive deletion or moving files.",
+               ]
+             : []),
+diff --git a/packages/happy-agent-modules/sources/systemPrompt/LEARNINGS.md b/packages/happy-agent-modules/sources/systemPrompt/LEARNINGS.md
+--- a/packages/happy-agent-modules/sources/systemPrompt/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/systemPrompt/LEARNINGS.md
+@@ -19,6 +19,7 @@
+ environment variables, exit checks, file paths, and hidden background helpers. Claude exposes
+ PowerShell on native Windows; Codex keeps exec_command. Bash belongs to Unix/WSL environments,
+ and native Windows does not support Git Bash. Tool descriptions must agree with this executor.
++Use Node package managers through their .cmd shims when PowerShell policy blocks .ps1 wrappers.
+ 
+ ## Codex prompts come from Codex's model catalog
+ 
+diff --git a/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts b/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
+--- a/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
++++ b/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
+@@ -26,6 +26,8 @@
+             expect(prompt).toContain("-LiteralPath");
+             expect(prompt).toContain("&&");
+             expect(prompt).toContain("$env:NAME");
++            expect(prompt).toContain("npm.cmd, npx.cmd, and pnpm.cmd");
++            expect(prompt).toContain("Preserve the user's execution policy");
+             expect(prompt).toContain("Start-Process -WindowStyle Hidden");
+             expect(prompt).not.toContain("- Shell: /bin/bash");
+             expect(prompt).not.toContain("- Shell: C:\\Program Files\\Git");

@@ -129,6 +129,7 @@ describe.runIf(process.platform === "win32" || process.platform === "darwin")(
             try {
                 await f.install();
                 for (const [key, value] of Object.entries(f.environment)) vi.stubEnv(key, value);
+                if (process.platform === "win32") vi.stubEnv("PATHEXT", ".CPL");
                 const starts = vi.spyOn(manager, "start");
                 const runCalls = vi
                     .spyOn(manager, "run")
@@ -173,7 +174,7 @@ describe.runIf(process.platform === "win32" || process.platform === "darwin")(
                 if (!machine) throw Error("Missing compute");
                 const command =
                     process.platform === "win32"
-                        ? "[Console]::Write('NATIVE_FULL_ACCESS_SENTINEL')"
+                        ? "if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { exit 1 }; [Console]::Write('NATIVE_FULL_ACCESS_SENTINEL')"
                         : "printf NATIVE_FULL_ACCESS_SENTINEL";
                 const full = await machine.shell.run({
                     command,
@@ -431,6 +432,21 @@ describe.runIf(process.platform === "win32" || process.platform === "darwin")(
                     Path: "two",
                 }),
             ).toThrow(/doğrulanamadı/u);
+        });
+
+        it.runIf(process.platform === "win32")("preserves Windows command extensions and restores .EXE for managed rg", () => {
+            const paths = ["C:\\python", "C:\\rg"];
+            const base = { Path: "original", PathExt: ".CPL;.CMD" };
+            expect(cyberFiCommandToolsEnvironment(paths, base, undefined)).toMatchObject({
+                PathExt: ".CPL;.CMD;.EXE",
+            });
+            expect(cyberFiCommandToolsEnvironment(paths, { Path: "original" }, undefined)).toMatchObject({
+                PATHEXT: ".EXE",
+            });
+            expect(cyberFiCommandToolsEnvironment(paths, { ...base, PathExt: ".exe;.CPL" }, undefined)).not.toHaveProperty("PathExt");
+            expect(cyberFiCommandToolsEnvironment(paths, base, { pathext: null })).toMatchObject({
+                pathext: null,
+            });
         });
 
         it("aborts a waiting start without launching a command", async () => {
