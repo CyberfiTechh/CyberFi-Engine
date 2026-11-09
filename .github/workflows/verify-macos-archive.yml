@@ -19,18 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-26
             target: darwin-arm64
             architecture: arm64
             bytes: 193764762
             sha256: dcfdd8ff878176b35e89951741080426a8a852b915093865707ad4b69b90b361
             sidecar_sha256: 38d4929186ec4ea1beb6969b61926eb97cef8587e885b5e033b5c309a654da50
-          - runner: macos-15-intel
-            target: darwin-x64
-            architecture: x86_64
-            bytes: 204619903
-            sha256: 873ad5cad6e4738403b086b0b2a7b16da8de7fb83cdfabe55d6b9084ad7cd269
-            sidecar_sha256: a7661819f06f91c7f00cdbb2603fef79be573117e01474b3c7b86652f3c1c563
     env:
       ENGINE_VERSION: 0.4.123-preview.1
       TARGET: ${{ matrix.target }}
