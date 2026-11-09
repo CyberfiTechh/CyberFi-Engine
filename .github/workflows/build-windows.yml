@@ -170,6 +170,8 @@ jobs:
               run: |
                   pnpm --filter @slopus/happy-agent-modules exec vitest run tests/collaboration/CollaborationModule.test.ts tests/subtasks/SubtaskPermissionModes.test.ts -t 'collaborator permission modes|subtask permission modes' --maxWorkers=2
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Verify archival preserves unregistered worktree files
+              run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/workspaces/WorkspaceArchiveStopsWork.test.ts --maxWorkers=1
             - name: Build workspace JavaScript
               run: pnpm build
             - name: Verify source named-pipe transports before signing and compiling
