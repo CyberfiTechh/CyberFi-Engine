@@ -164,7 +164,7 @@ jobs:
               run: |
                   node --test cyberfi-overlay/branding/command-tool-read-policy.test.mjs
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/systemPrompt/SystemPromptWindows.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/systemPrompt/SystemPromptWindows.test.ts tests/compute/impl/readComputeTextFile.test.ts tests/compute/claude/claudeComputeSurface.test.ts tests/compute/grok/grokComputeToolSurface.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Verify human Full access inheritance and queued human restrictions
               run: |
@@ -262,7 +262,7 @@ jobs:
             - name: Verify native sandbox enforcement
               run: pnpm --filter @slopus/happy-agent-supervisor test:native:windows
             - name: Verify both halves of the runner protocol on Windows
-              run: pnpm --filter @slopus/happy-agent-compute exec vitest run tests/runner
+              run: pnpm --filter @slopus/happy-agent-compute exec vitest run tests/runner tests/processes/impl/shellCommandArgs.test.ts tests/host/createHostShell.test.ts tests/supervisor/createSupervisorCommand.test.ts
             - name: Exercise the packaged executable
               run: |
                   $binary = 'packages/happy-agent/dist/bin/happy-agent-win32-x64.exe'

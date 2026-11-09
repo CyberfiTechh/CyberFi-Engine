@@ -1,0 +1,14 @@
+name: Verify CyberFi Windows Unicode candidate
+on:
+    workflow_dispatch:
+permissions:
+    contents: read
+jobs:
+    windows:
+        if: github.repository == 'CyberfiTechh/CyberFi-Engine' && github.ref == 'refs/heads/codex/cyberfi-windows-unicode'
+        uses: ./.github/workflows/build-windows.yml
+        permissions:
+            contents: read
+            id-token: write
+        with:
+            version: '0.4.122-preview.1'

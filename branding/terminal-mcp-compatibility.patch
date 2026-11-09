@@ -113,11 +113,12 @@ diff --git a/packages/happy-agent-modules/tests/mcp/fixtures/stdioServer.mjs b/p
 diff --git a/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts b/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
 --- a/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
 +++ b/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
-@@ -43,6 +43,7 @@
+@@ -43,6 +43,8 @@
              ? [
                    "- Commands run on native Windows in PowerShell. Use native Windows tools and paths. Bash is available only in a Linux environment such as WSL, not in this native Windows session; do not use Git Bash.",
                    "- Use PowerShell syntax: $env:NAME = 'value' for environment variables; & 'C:\\Program Files\\tool.exe' for a quoted executable; -LiteralPath for file operations. Separate commands with newlines. PowerShell 5.1 does not support &&, ||, export, or Bash heredocs. Check $LASTEXITCODE after native programs before continuing dependent work.",
 +                  "- Run Node package managers through their Windows command shims, for example npm.cmd, npx.cmd, and pnpm.cmd. PowerShell can resolve the bare names to .ps1 wrappers that the current execution policy blocks. Preserve the user's execution policy.",
++                  "- For BOM-less UTF-8 files on Windows PowerShell, use Get-Content -LiteralPath with -Encoding UTF8. If a file or a native tool uses a different known encoding, select it explicitly and keep the original bytes intact.",
                    "- Start background helpers with Start-Process -WindowStyle Hidden unless the user needs a visible window. Keep filesystem operations in one shell and verify the resolved target before recursive deletion or moving files.",
                ]
              : []),
@@ -135,12 +136,13 @@ diff --git a/packages/happy-agent-modules/sources/systemPrompt/LEARNINGS.md b/pa
 diff --git a/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts b/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
 --- a/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
 +++ b/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
-@@ -26,6 +26,8 @@
+@@ -26,6 +26,9 @@
              expect(prompt).toContain("-LiteralPath");
              expect(prompt).toContain("&&");
              expect(prompt).toContain("$env:NAME");
 +            expect(prompt).toContain("npm.cmd, npx.cmd, and pnpm.cmd");
 +            expect(prompt).toContain("Preserve the user's execution policy");
++            expect(prompt).toContain("Get-Content -LiteralPath with -Encoding UTF8");
              expect(prompt).toContain("Start-Process -WindowStyle Hidden");
              expect(prompt).not.toContain("- Shell: /bin/bash");
              expect(prompt).not.toContain("- Shell: C:\\Program Files\\Git");

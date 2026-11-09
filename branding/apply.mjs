@@ -88,6 +88,9 @@ export function apply(platform, directory) {
   const compatibility = join(here, 'terminal-mcp-compatibility.patch');
   execFileSync('git', ['-C', root, 'apply', '--check', compatibility]);
   execFileSync('git', ['-C', root, 'apply', compatibility]);
+  const windowsUnicode = join(here, 'windows-unicode.patch');
+  execFileSync('git', ['-C', root, 'apply', '--check', windowsUnicode]);
+  execFileSync('git', ['-C', root, 'apply', windowsUnicode]);
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   const computePolicy = join(root, 'packages/happy-agent-modules/sources/compute/ComputeModule.ts');

@@ -1,0 +1,361 @@
+diff --git a/packages/happy-agent-compute/sources/processes/impl/shellCommandArgs.ts b/packages/happy-agent-compute/sources/processes/impl/shellCommandArgs.ts
+index 69f493e..eec1ecf 100644
+--- a/packages/happy-agent-compute/sources/processes/impl/shellCommandArgs.ts
++++ b/packages/happy-agent-compute/sources/processes/impl/shellCommandArgs.ts
+@@ -4,7 +4,28 @@ import { basename } from "node:path";
+ export function shellCommandArgs(shell: string, command: string): string[] {
+     const name = basename(shell).toLowerCase();
+     if (name === "cmd.exe" || name === "cmd") return ["/d", "/s", "/c", command];
+-    if (["powershell.exe", "powershell", "pwsh.exe", "pwsh"].includes(name))
++    if (name === "powershell.exe" || name === "powershell") {
++        const source = command.replace(/['\u2018\u2019\u201A\u201B]/gu, "$&$&");
++        // Configure only this command's streams. Keep the supplied script's prologue intact.
++        const script = [
++            "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false)",
++            "if (-not (Test-Path Env:PYTHONIOENCODING)) { $env:PYTHONIOENCODING = 'utf-8' }",
++            "$__cyberFiScript = [ScriptBlock]::Create('" + source + "')",
++            "if ($null -eq $__cyberFiScript) { exit 1 }",
++            "$__cyberFiLastBlock = $__cyberFiScript.Ast.EndBlock",
++            "if ($null -eq $__cyberFiLastBlock) { $__cyberFiLastBlock = $__cyberFiScript.Ast.ProcessBlock }",
++            "if ($null -eq $__cyberFiLastBlock) { $__cyberFiLastBlock = $__cyberFiScript.Ast.BeginBlock }",
++            // PowerShell 5.1 resets $? on return from a script block, so report failure inside it.
++            "if ($null -ne $__cyberFiLastBlock) {",
++            "  $__cyberFiEnd = $__cyberFiLastBlock.Extent.EndOffset",
++            "  if (-not $__cyberFiLastBlock.Unnamed) { $__cyberFiEnd-- }",
++            '  $__cyberFiScript = [ScriptBlock]::Create($__cyberFiScript.Ast.Extent.Text.Insert($__cyberFiEnd, "`nif (-not `$?) { exit 1 }`n"))',
++            "}",
++            ". $__cyberFiScript",
++        ].join("\n");
++        return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script];
++    }
++    if (name === "pwsh.exe" || name === "pwsh")
+         return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command];
+     return ["-lc", command];
+ }
+diff --git a/packages/happy-agent-compute/tests/host/createHostShell.test.ts b/packages/happy-agent-compute/tests/host/createHostShell.test.ts
+index ec9a9d6..1c1e759 100644
+--- a/packages/happy-agent-compute/tests/host/createHostShell.test.ts
++++ b/packages/happy-agent-compute/tests/host/createHostShell.test.ts
+@@ -337,7 +337,7 @@ describe("createHostShell commands", () => {
+                           "-NoProfile",
+                           "-NonInteractive",
+                           "-Command",
+-                          "true",
++                          expect.stringContaining("[ScriptBlock]::Create('true')"),
+                       ]
+                     : [
+                           "--policy",
+@@ -436,7 +436,7 @@ describe("createHostShell commands", () => {
+                           "-NoProfile",
+                           "-NonInteractive",
+                           "-Command",
+-                          "true",
++                          expect.stringContaining("[ScriptBlock]::Create('true')"),
+                       ]
+                     : [
+                           "--policy",
+diff --git a/packages/happy-agent-modules/sources/compute/impl/readComputeTextFile.ts b/packages/happy-agent-modules/sources/compute/impl/readComputeTextFile.ts
+index 72c2b0e..6372c57 100644
+--- a/packages/happy-agent-modules/sources/compute/impl/readComputeTextFile.ts
++++ b/packages/happy-agent-modules/sources/compute/impl/readComputeTextFile.ts
+@@ -37,13 +37,30 @@ export async function readComputeTextFile(
+         readonly offset?: number;
+         readonly limit?: number;
+         readonly maxLines: number;
++        readonly encoding?: string;
+     },
+ ): Promise<ComputeTextFileRead> {
+     const permissions = computePermissionsForContext(ctx);
+     const filePath = resolveComputePath(options.path, compute.cwd, compute.fs.home);
+     const stat = await compute.fs.stat(permissions, filePath);
+     if (stat.isDirectory) throw new Error(`This path is a directory, not a file: ${filePath}`);
+-    const raw = await compute.fs.readFile(permissions, filePath);
++    const bytes = await compute.fs.readFileBuffer(permissions, filePath);
++    const encoding = options.encoding ?? bomEncoding(bytes);
++    let decoder: TextDecoder;
++    try {
++        decoder = new TextDecoder(encoding, { fatal: true });
++    } catch {
++        throw new Error("Unsupported text encoding. Use a label such as utf-8 or windows-1254.");
++    }
++    let raw: string;
++    try {
++        raw = decoder.decode(bytes);
++    } catch {
++        throw new Error(
++            "The file is not valid text in the selected encoding. Supply the known encoding for legacy text.",
++        );
++    }
++    if (raw.includes("\0")) throw new Error("Binary files cannot be read through this text tool.");
+     const lines = raw.split(/\r?\n/);
+     const startLine = options.offset === undefined || options.offset < 1 ? 1 : options.offset;
+     const selected = lines.slice(
+@@ -59,3 +76,9 @@ export async function readComputeTextFile(
+         moreLines: startLine - 1 + selected.length < lines.length,
+     };
+ }
++
++function bomEncoding(bytes: Uint8Array): string {
++    if (bytes[0] === 0xff && bytes[1] === 0xfe) return "utf-16le";
++    if (bytes[0] === 0xfe && bytes[1] === 0xff) return "utf-16be";
++    return "utf-8";
++}
+diff --git a/packages/happy-agent-modules/sources/compute/tools/claude/Read.ts b/packages/happy-agent-modules/sources/compute/tools/claude/Read.ts
+index 8ccad9c..83ebbdd 100644
+--- a/packages/happy-agent-modules/sources/compute/tools/claude/Read.ts
++++ b/packages/happy-agent-modules/sources/compute/tools/claude/Read.ts
+@@ -41,6 +41,7 @@ If the user provides a path to a file, assume the path is valid. It is okay to r
+ 
+ Usage:
+ - The file_path parameter must be an absolute path, not a relative path
++- Text defaults to UTF-8 or the Unicode BOM. For legacy text, provide its known encoding. This option only applies to reading.
+ - By default, it reads up to ${String(MAX_LINES_TO_READ)} lines starting from the beginning of the file
+ - You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
+ - Results are returned using cat -n format, with line numbers starting at 1
+@@ -121,6 +122,14 @@ function createClaudeReadTool(
+         parameters: Type.Object(
+             {
+                 file_path: Type.String({ description: "The absolute path to the file to read" }),
++                encoding: Type.Optional(
++                    Type.String({
++                        minLength: 1,
++                        maxLength: 64,
++                        description:
++                            "Known text encoding such as windows-1254. Defaults to UTF-8 or the Unicode BOM.",
++                    }),
++                ),
+                 offset: Type.Optional(
+                     Type.Integer({
+                         description:
+@@ -149,7 +158,7 @@ function createClaudeReadTool(
+             shouldReviewComputePath(compute, file_path, { write: false }, ctx),
+         shouldRunInFullAccessInAutoMode: ({ file_path }, ctx) =>
+             shouldReviewComputePath(compute, file_path, { write: false }, ctx),
+-        execute: async (ctx, { file_path, offset, limit }) => {
++        execute: async (ctx, { file_path, offset, limit, encoding }) => {
+             const filePath = resolveComputePath(file_path, compute.cwd, compute.fs.home);
+             const lower = filePath.toLowerCase();
+             if (lower.endsWith(".ipynb")) {
+@@ -199,6 +208,7 @@ function createClaudeReadTool(
+                 path: filePath,
+                 ...(offset === undefined ? {} : { offset }),
+                 ...(limit === undefined ? {} : { limit }),
++                ...(encoding === undefined ? {} : { encoding }),
+                 maxLines: MAX_LINES_TO_READ,
+             });
+             // A file with nothing in it still splits into one empty line; saying it has a line
+diff --git a/packages/happy-agent-modules/sources/compute/tools/grok/read_file.ts b/packages/happy-agent-modules/sources/compute/tools/grok/read_file.ts
+index 985d31e..91997ed 100644
+--- a/packages/happy-agent-modules/sources/compute/tools/grok/read_file.ts
++++ b/packages/happy-agent-modules/sources/compute/tools/grok/read_file.ts
+@@ -26,6 +26,7 @@ export function grokReadFileTool(compute: Compute, reads: FileReadLog) {
+ 
+ Usage:
+ - target_file can be a relative path in the workspace or an absolute path.
++- Text defaults to UTF-8 or the Unicode BOM. For legacy text, provide its known encoding. This option only applies to reading.
+ - By default, it reads up to ${String(MAX_LINES)} lines starting from the beginning of the file.
+ - Results are returned with line numbers starting at 1 in the format LINE_NUMBER→LINE_CONTENT.
+ - Reading records the file's current state so a later write can detect if somebody else changed it first.`,
+@@ -35,6 +36,14 @@ Usage:
+                     description:
+                         "The path of the file to read. You can use a relative path in the workspace or an absolute path.",
+                 }),
++                encoding: Type.Optional(
++                    Type.String({
++                        minLength: 1,
++                        maxLength: 64,
++                        description:
++                            "Known text encoding such as windows-1254. Defaults to UTF-8 or the Unicode BOM.",
++                    }),
++                ),
+                 offset: Type.Optional(
+                     Type.Integer({
+                         description:
+@@ -71,11 +80,12 @@ Usage:
+             shouldReviewComputePath(compute, target_file, { write: false }, ctx),
+         shouldRunInFullAccessInAutoMode: ({ target_file }, ctx) =>
+             shouldReviewComputePath(compute, target_file, { write: false }, ctx),
+-        execute: async (ctx, { target_file, offset, limit }) => {
++        execute: async (ctx, { target_file, offset, limit, encoding }) => {
+             const page = await readComputeTextFile(compute, reads, ctx, {
+                 path: target_file,
+                 ...(offset === undefined ? {} : { offset }),
+                 ...(limit === undefined ? {} : { limit }),
++                ...(encoding === undefined ? {} : { encoding }),
+                 maxLines: MAX_LINES,
+             });
+             // A file with nothing in it still splits into one empty line; saying it holds one
+diff --git a/packages/happy-agent-modules/tests/compute/claude/claudeComputeSurface.test.ts b/packages/happy-agent-modules/tests/compute/claude/claudeComputeSurface.test.ts
+index 5d1d141..d34ee84 100644
+--- a/packages/happy-agent-modules/tests/compute/claude/claudeComputeSurface.test.ts
++++ b/packages/happy-agent-modules/tests/compute/claude/claudeComputeSurface.test.ts
+@@ -23,7 +23,7 @@ const CLAUDE_MODEL = "anthropic/opus-5";
+ const VENDOR_ARGUMENTS: Readonly<
+     Record<string, { readonly required: readonly string[]; readonly optional: readonly string[] }>
+ > = {
+-    Read: { required: ["file_path"], optional: ["offset", "limit"] },
++    Read: { required: ["file_path"], optional: ["offset", "limit", "encoding"] },
+     // Happy Agent adds the same reviewed elevation flag as Bash to file mutations.
+     Write: { required: ["file_path", "content"], optional: ["dangerouslyDisableSandbox"] },
+     Edit: {
+diff --git a/packages/happy-agent-modules/tests/compute/grok/grokComputeToolSurface.test.ts b/packages/happy-agent-modules/tests/compute/grok/grokComputeToolSurface.test.ts
+index 3df6e82..856c7ad 100644
+--- a/packages/happy-agent-modules/tests/compute/grok/grokComputeToolSurface.test.ts
++++ b/packages/happy-agent-modules/tests/compute/grok/grokComputeToolSurface.test.ts
+@@ -39,6 +39,7 @@ const vendorSchemas: Readonly<
+         required: ["target_file"],
+         // Neither belongs on a machine that cannot render a PDF.
+         omitted: ["pages", "format"],
++        added: ["encoding"],
+     },
+     write: {
+         properties: ["file_path", "content"],
+diff --git a/packages/happy-agent-modules/tests/runtime/HappyAgentDatabaseDeadlock.child.ts b/packages/happy-agent-modules/tests/runtime/HappyAgentDatabaseDeadlock.child.ts
+index 431ec12..ac4f61b 100644
+--- a/packages/happy-agent-modules/tests/runtime/HappyAgentDatabaseDeadlock.child.ts
++++ b/packages/happy-agent-modules/tests/runtime/HappyAgentDatabaseDeadlock.child.ts
+@@ -119,9 +119,8 @@ function computeWithGates(): {
+     const readReadyToRecord = deferred<void>();
+     const allowReadRecord = deferred<void>();
+     const stat = compute.fs.stat;
+-    const readFile = compute.fs.readFile;
++    const readFileBuffer = compute.fs.readFileBuffer;
+     let heldSearchStat = false;
+-    let targetReads = 0;
+ 
+     compute.fs.stat = async (permissions, path) => {
+         const result = await stat(permissions, path);
+@@ -136,14 +135,11 @@ function computeWithGates(): {
+         }
+         return result;
+     };
+-    compute.fs.readFile = async (permissions, path) => {
+-        const result = await readFile(permissions, path);
++    compute.fs.readFileBuffer = async (permissions, path, options) => {
++        const result = await readFileBuffer(permissions, path, options);
+         if (path === FILE_PATH) {
+-            targetReads += 1;
+-            if (targetReads === 2) {
+-                readReadyToRecord.resolve();
+-                await allowReadRecord.promise;
+-            }
++            readReadyToRecord.resolve();
++            await allowReadRecord.promise;
+         }
+         return result;
+     };
+diff --git a/packages/happy-agent-compute/tests/processes/impl/shellCommandArgs.test.ts b/packages/happy-agent-compute/tests/processes/impl/shellCommandArgs.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/happy-agent-compute/tests/processes/impl/shellCommandArgs.test.ts
+@@ -0,0 +1,37 @@
++import { spawnSync } from "node:child_process";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import { shellCommandArgs } from "../../../sources/processes/impl/shellCommandArgs.js";
++
++describe.skipIf(process.platform !== "win32")("Windows PowerShell command encoding", () => {
++    const powershell = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
++    const run = (script: string, input?: string) =>
++        spawnSync(powershell, shellCommandArgs(powershell, script), {
++            encoding: "utf8",
++            input,
++            windowsHide: true,
++        });
++
++    it("round-trips UTF-8 through native stdin and stdout", () => {
++        const text = "çğıİöşü 日本語 🚀";
++        const node = process.execPath.replaceAll("'", "''");
++        const script = [
++            "[Console]::ReadLine()",
++            "'" + text + "' | & '" + node + "' -e 'process.stdin.pipe(process.stdout)'",
++            "Write-Output '" + text + "'",
++        ].join("\n");
++        const result = run(script, text + "\n");
++        expect(result.status).toBe(0);
++        expect(result.stdout.trim().split(/\r?\n/)).toEqual([text, text, text]);
++    });
++
++    it("keeps script prologues and command exit status", () => {
++        expect(run("using namespace System; param($s = 'ç'); [String]$s").stdout.trim()).toBe("ç");
++        expect(run("begin { 'ç' } end { 'ş' }").stdout.trim().split(/\r?\n/)).toEqual(["ç", "ş"]);
++        expect(run("cmd /d /c exit 17").status).toBe(1);
++        expect(run("exit 17").status).toBe(17);
++        expect(run("Write-Error 'ç'").stderr).toContain("ç");
++        expect(run("Write-Error 'ç'").status).toBe(1);
++        expect(run("if (").status).toBe(1);
++    });
++});
+diff --git a/packages/happy-agent-modules/tests/compute/impl/readComputeTextFile.test.ts b/packages/happy-agent-modules/tests/compute/impl/readComputeTextFile.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/happy-agent-modules/tests/compute/impl/readComputeTextFile.test.ts
+@@ -0,0 +1,68 @@
++import { createRootContext } from "@steve.kite/stdlib";
++import { describe, expect, it, vi } from "vitest";
++
++import { readComputeTextFile } from "../../../sources/compute/impl/readComputeTextFile.js";
++import type { FileReadLog } from "../../../sources/impl/FileReadLog.js";
++import { FakeCompute } from "../support/FakeCompute.js";
++
++const ctx = createRootContext().named("compute-text-encoding");
++const path = "/workspace/Çalışma alanı/öğrenci-🚀.txt";
++const text = "çğıİöşü 🚀";
++
++function fixture(bytes: Uint8Array) {
++    const compute = new FakeCompute();
++    compute.writeBuffer(path, bytes);
++    const record = vi.fn(async () => {});
++    const reads = { record } as unknown as FileReadLog;
++    return {
++        record,
++        read: (encoding?: string) =>
++            readComputeTextFile(compute, reads, ctx, {
++                path,
++                maxLines: 1,
++                ...(encoding === undefined ? {} : { encoding }),
++            }),
++    };
++}
++
++describe("compute text read encodings", () => {
++    const unicode = text + "\r\nsecond line";
++    const littleEndian = Buffer.from(unicode, "utf16le");
++    it.each([
++        ["UTF-8", Buffer.from(unicode, "utf8")],
++        ["UTF-8 BOM", Buffer.from("\ufeff" + unicode, "utf8")],
++        ["UTF-16 LE BOM", Buffer.concat([Buffer.from([0xff, 0xfe]), littleEndian])],
++        [
++            "UTF-16 BE BOM",
++            Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(littleEndian).swap16()]),
++        ],
++    ] as const)("reads %s and keeps line paging", async (_encoding, bytes) => {
++        const { read, record } = fixture(bytes);
++
++        await expect(read()).resolves.toMatchObject({
++            path,
++            lines: [text],
++            startLine: 1,
++            totalLines: 2,
++            moreLines: true,
++        });
++        expect(record).toHaveBeenCalledOnce();
++    });
++
++    it("reads a known legacy encoding without guessing it", async () => {
++        const { read, record } = fixture(Uint8Array.of(0xe7, 0xf0, 0xfd, 0xdd, 0xf6, 0xfe, 0xfc));
++
++        await expect(read()).rejects.toThrow("Supply the known encoding");
++        expect(record).not.toHaveBeenCalled();
++        await expect(read("windows-1254")).resolves.toMatchObject({ lines: [text.slice(0, 7)] });
++        expect(record).toHaveBeenCalledOnce();
++    });
++
++    it("refuses unknown encodings and binary text without recording a read", async () => {
++        const { read, record } = fixture(Uint8Array.of(0x61, 0x00, 0x62));
++
++        await expect(read("not-a-code-page")).rejects.toThrow("Unsupported text encoding");
++        await expect(read()).rejects.toThrow("Binary files");
++        expect(record).not.toHaveBeenCalled();
++    });
++});
