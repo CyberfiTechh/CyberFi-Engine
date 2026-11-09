@@ -268,8 +268,10 @@ jobs:
             - name: Exercise the packaged executable
               run: |
                   $binary = 'packages/happy-agent/dist/bin/happy-agent-win32-x64.exe'
-                  & $binary --version
+                  $version = & $binary --version
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  if ($version -cne "Happy Agent $env:HAPPY_AGENT_RELEASE_VERSION") { throw 'Compiled engine version mismatch' }
+                  Write-Output $version
                   node packages/happy-agent/scripts/smoke-binary-transports.mjs $binary
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Exercise installed skills in the actual restricted parent and child
