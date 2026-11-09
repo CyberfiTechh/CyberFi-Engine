@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,7 @@ const anchor = `            ...(permissions.allowedReadPaths === undefined
 const replacement = `            ...(permissions.allowedReadPaths === undefined && (options.hostPolicy?.readableDirectories?.length ?? 0) === 0
                 ? {}
                 : { allowedReadPaths: [...(permissions.allowedReadPaths ?? []), ...existingHostPaths(canonicalCwd, options.hostPolicy?.readableDirectories ?? [])] }),`;
+const shellSdkSha256 = '349fb07a7eb1501bc127908a49a2f8d54ad0400a9cf51c037b64cacd3dc61754';
 const hash = value => createHash('sha256').update(value).digest('hex');
 export function patchSdk(directory, verify = false) {
     const root = realpathSync(resolve(directory));
@@ -22,23 +23,34 @@ export function patchSdk(directory, verify = false) {
     assert.equal(metadata.name, '@slopus/happy-agent-compute');
     assert.equal(metadata.version, '0.1.30', 'Only the pinned published SDK is supported');
     const target = realpathSync(join(dirname(entries[0]), 'host/createHostShell.js'));
-    const fromRoot = relative(root, target);
-    assert(!isAbsolute(fromRoot) && fromRoot !== '..' && !fromRoot.startsWith('../') && !fromRoot.startsWith('..\\'), 'Never modify an SDK outside this checkout');
+    const shell = realpathSync(join(dirname(entries[0]), 'processes/impl/shellCommandArgs.js'));
+    for (const file of [target, shell]) {
+        const fromRoot = relative(root, file);
+        assert(!isAbsolute(fromRoot) && fromRoot !== '..' && !fromRoot.startsWith('../') && !fromRoot.startsWith('..\\'), 'Never modify an SDK outside this checkout');
+    }
+    const shellSource = join(root, 'packages', 'happy-agent-compute', 'sources', 'processes', 'impl', 'shellCommandArgs.ts');
+    const shellReplacement = stripTypeScriptTypes(readFileSync(shellSource, 'utf8'));
+    assert(shellReplacement.includes('$OutputEncoding = [Text.UTF8Encoding]'), 'Unicode shell source patch is missing');
     const before = readFileSync(target, 'utf8');
     if (verify) {
         assert.equal(before.split(replacement).length - 1, 1, 'Patched SDK forwarding is missing');
         assert(!before.includes(anchor));
+        assert.equal(readFileSync(shell, 'utf8'), shellReplacement, 'Unicode shell SDK differs from the tested source');
     } else {
         assert.equal(before.split(anchor).length - 1, 1, 'Published SDK anchor must match exactly once');
         assert(!before.includes(replacement));
+        assert.equal(hash(readFileSync(shell)), shellSdkSha256, 'Published shell SDK bytes must match the pinned version');
         const after = before.replace(anchor, replacement);
         // pnpm may hardlink this installed file to its shared content-addressed store.
         // Detach the checkout's entry before writing; never mutate a shared inode.
         unlinkSync(target);
         writeFileSync(target, after, 'utf8');
         assert.equal(readFileSync(target, 'utf8'), after);
+        unlinkSync(shell);
+        writeFileSync(shell, shellReplacement, 'utf8');
+        assert.equal(readFileSync(shell, 'utf8'), shellReplacement);
     }
-    return { sdkVersion: metadata.version, sameCanonicalSdk: true, sdkReadRootsForwarded: true, sdkSha256: hash(readFileSync(target)) };
+    return { sdkVersion: metadata.version, sameCanonicalSdk: true, sdkReadRootsForwarded: true, sdkUnicodeShellSha256: hash(readFileSync(shell)), sdkSha256: hash(readFileSync(target)) };
 }
 function selfCheck() {
     const root = mkdtempSync(join(tmpdir(), 'cyberfi-sdk-check-'));
@@ -55,8 +67,17 @@ function selfCheck() {
         const store = join(root, 'unchanged-store-original.js');
         writeFileSync(store, anchor);
         linkSync(store, join(sdk, 'dist', 'host', 'createHostShell.js'));
+        const shellSource = join(root, 'packages', 'happy-agent-compute', 'sources', 'processes', 'impl');
+        mkdirSync(shellSource, { recursive: true });
+        writeFileSync(join(shellSource, 'shellCommandArgs.ts'), 'export const output: string = "$OutputEncoding = [Text.UTF8Encoding]";');
+        mkdirSync(join(sdk, 'dist', 'processes', 'impl'), { recursive: true });
+        const shellStore = join(root, 'unchanged-shell-store.js');
+        const pinnedShell = "import { basename } from \"node:path\";\n/** Shell syntax is selected from the executable; arguments remain an argv vector. */\nexport function shellCommandArgs(shell, command) {\n    const name = basename(shell).toLowerCase();\n    if (name === \"cmd.exe\" || name === \"cmd\")\n        return [\"/d\", \"/s\", \"/c\", command];\n    if ([\"powershell.exe\", \"powershell\", \"pwsh.exe\", \"pwsh\"].includes(name))\n        return [\"-NoLogo\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", command];\n    return [\"-lc\", command];\n}\n//# sourceMappingURL=shellCommandArgs.js.map";
+        writeFileSync(shellStore, pinnedShell);
+        linkSync(shellStore, join(sdk, 'dist', 'processes', 'impl', 'shellCommandArgs.js'));
         patchSdk(root); patchSdk(root, true);
         assert.equal(readFileSync(store, 'utf8'), anchor, 'Shared hardlink source changed');
+        assert.equal(readFileSync(shellStore, 'utf8'), pinnedShell, 'Shared shell hardlink source changed');
         writeFileSync(join(sdk, 'package.json'), JSON.stringify({ ...metadata, version: '0.1.31' }));
         assert.throws(() => patchSdk(root, true), /pinned published SDK/);
         writeFileSync(join(sdk, 'package.json'), JSON.stringify(metadata));

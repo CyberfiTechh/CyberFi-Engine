@@ -277,6 +277,8 @@ try {
             if ((await client.getMode(id)).mode?.permissionMode !== 'full_access') return undefined;
             const calls = toolsOf(await client.getMessages(id));
             const shellCalls = calls.filter(tool => ['exec_command', 'write_stdin'].includes(tool.name) && tool.status !== 'running');
+            const failedShell = shellCalls.find(tool => /Process exited with code (?!0\b)-?\d+/u.test(output(tool)));
+            assert(!failedShell, 'Owned full-access shell failed: ' + String(failedShell && output(failedShell)).slice(0, 1500));
             const shell = shellCalls.find(tool => output(tool).includes(sentinel));
             const mcp = calls.find(tool => tool.name === 'call_mcp_tool' && tool.status !== 'running');
             if (!shell || !mcp) return undefined;
