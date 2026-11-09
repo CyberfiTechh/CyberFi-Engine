@@ -51,6 +51,10 @@ const root = windows ? join(profile, '.pdr-kocum-agent') : join(fixtureRoot, 'ho
 if (windows) await mkdir(root);
 const externalProject = join(fixtureRoot, 'outside-workspace');
 await mkdir(externalProject);
+const unicodeFile = join(externalProject, 'PdrKoçum İğüşöç 世界 🧪.txt');
+const unicodeNativeOutput = 'OWNED_NATIVE_UTF8 İıĞğŞşÜüÖöÇç e\u0301 世界 🧪';
+const unicodeShellOutput = 'OWNED_SHELL_UTF8 Türkçe 日本語 🧪';
+if (windows) await writeFile(unicodeFile, unicodeNativeOutput + '\n', 'utf8');
 const happyHome = join(root, '.happy');
 const role = join(root, '.agents', 'skills', 'owned-review');
 const support = join(role, 'support.txt');
@@ -80,9 +84,16 @@ const rgCommand = () => {
         ? `$ErrorActionPreference = 'Stop'; if ((Get-Command rg).Source -ine '${exact.replaceAll("'", "''")}') { exit 2 }; rg --version`
         : `test "$(command -v rg)" = '${exact.replaceAll("'", "'\\''")}' && rg --version`;
 };
+const unicodePipeline = () => [
+    "@'",
+    `process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(unicodeFile)}, 'utf8'));`,
+    `'@ | & '${process.execPath.replaceAll("'", "''")}' -`,
+    'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+    `Write-Output '${unicodeShellOutput}'`,
+].join('\n');
 const shellCheck = sentinel => {
     const cmd = process.platform === 'win32'
-        ? `${rgCommand()}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $npmVersion = npm.cmd --version; if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^[0-9]+[.][0-9]+[.][0-9]+') { exit 1 }; Write-Output '${sentinel}'`
+        ? `${rgCommand()}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $npmVersion = npm.cmd --version; if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^[0-9]+[.][0-9]+[.][0-9]+') { exit 1 }\n${unicodePipeline()}\nWrite-Output '${sentinel}'`
         : `${rgCommand()} && printf '%s\\n' '${sentinel}'`;
     return { name: 'exec_command', arguments: { cmd, yield_time_ms: 30000 } };
 };
@@ -170,6 +181,10 @@ async function wait(work, milliseconds = 60000) {
 }
 const toolsOf = history => history.runs.flatMap(run => run.messages).flatMap(message => message.content).filter(block => block.type === 'tool_call');
 const output = tool => typeof tool.result === 'string' ? tool.result : tool.result?.output ?? JSON.stringify(tool.result);
+function assertUnicodeOutput(text) {
+    assert(text.includes(unicodeNativeOutput), 'Native Unicode pipeline failed: ' + text.slice(0, 1500));
+    assert(text.includes(unicodeShellOutput), 'PowerShell Unicode output was corrupted: ' + text.slice(0, 1500));
+}
 function deepListing(tool, server) {
     assert.equal(tool.status, 'completed');
     for (const call of deepMcpCalls.filter(call => call.arguments.server === server))
@@ -262,12 +277,15 @@ try {
             if ((await client.getMode(id)).mode?.permissionMode !== 'full_access') return undefined;
             const calls = toolsOf(await client.getMessages(id));
             const shellCalls = calls.filter(tool => ['exec_command', 'write_stdin'].includes(tool.name) && tool.status !== 'running');
+            const failedShell = shellCalls.find(tool => /Process exited with code (?!0\b)-?\d+/u.test(output(tool)));
+            assert(!failedShell, 'Owned full-access shell failed: ' + String(failedShell && output(failedShell)).slice(0, 1500));
             const shell = shellCalls.find(tool => output(tool).includes(sentinel));
             const mcp = calls.find(tool => tool.name === 'call_mcp_tool' && tool.status !== 'running');
             if (!shell || !mcp) return undefined;
             assert.equal(shell.status, 'completed'); assert(output(shell).includes(sentinel));
             assert(shellCalls.some(tool => output(tool).includes('ripgrep 15.2.0')), 'Native ripgrep result missing');
             if (!shellCalls.some(tool => output(tool).includes('Process exited with code 0'))) return undefined;
+            if (windows) assertUnicodeOutput(shellCalls.map(output).join('\n'));
             assert.equal(mcp.status, 'completed', 'Owned child MCP failed: ' + String(output(mcp)).slice(0, 1500)); assert(output(mcp).includes('owned-native:' + sentinel + '_MCP'));
             if (!nested) return true;
             const listings = calls.filter(tool => tool.name === 'list_mcp_tools' && tool.status !== 'running');
@@ -293,6 +311,7 @@ try {
     assert.equal(parentShell.status, 'completed');
     assert.match(output(parentShell), /ripgrep 15\.2\.0/u);
     assert(output(parentShell).includes('FULL_ACCESS_PARENT_SENTINEL') && output(parentShell).includes('Process exited with code 0'));
+    if (windows) assertUnicodeOutput(output(parentShell));
     for (const server of deepServers) deepListing(await request(parent, deepList(server), 'full_access'), server);
     for (const call of deepMcpCalls) {
         const result = await request(parent, call, 'full_access');
@@ -310,7 +329,7 @@ try {
     }
     assert.equal(await readFile(support, 'utf8'), 'OWNED_SUPPORT_SENTINEL');
     assert.equal(await readFile(unrelated, 'utf8'), 'UNRELATED_PRIVATE_SENTINEL');
-    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, fullAccessChildAndGrandchild: true, nativeFullAccessChildShellAndMcp: true, existingChildFullShellAndMcp: true, realRipgrepMainAndDescendants: true, windowsRestrictedOutsideHome: windows, windowsNarrowerDenyAfterWarm: windows, deepMcpListedAndCalledMain: 31, deepMcpListedAndCalledChild: 31, mcpBackendFixture: true, paidInference: false }));
+    console.log(JSON.stringify({ actualBinary: true, parentSkill: true, parentSupport: true, readOnlyChildSkill: true, readOnlyChildSupport: true, unrelatedPrivateDenied: true, sentinelsIntact: true, nativeMcpAlias: true, optionalSearchUnavailableNeutral: true, fullAccessChildAndGrandchild: true, nativeFullAccessChildShellAndMcp: true, existingChildFullShellAndMcp: true, realRipgrepMainAndDescendants: true, windowsUnicodePipelineMainAndDescendants: windows, windowsRestrictedOutsideHome: windows, windowsNarrowerDenyAfterWarm: windows, deepMcpListedAndCalledMain: 31, deepMcpListedAndCalledChild: 31, mcpBackendFixture: true, paidInference: false }));
 } catch (error) {
     if (process.platform === 'win32') {
         const paths = [root, join(root, '.agents'), join(root, '.agents', 'skills'), role, support];
