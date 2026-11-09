@@ -1,0 +1,446 @@
+diff --git a/packages/happy-agent-modules/sources/compute/impl/searchComputeFileContents.ts b/packages/happy-agent-modules/sources/compute/impl/searchComputeFileContents.ts
+index 4051e45..2d28ef5 100644
+--- a/packages/happy-agent-modules/sources/compute/impl/searchComputeFileContents.ts
++++ b/packages/happy-agent-modules/sources/compute/impl/searchComputeFileContents.ts
+@@ -18,6 +18,7 @@ export interface ComputeContentMatches {
+     readonly matchedFiles: number;
+     readonly matchCount: number;
+     readonly truncated: boolean;
++    readonly ioIncomplete?: true;
+ }
+ 
+ /** How much of one matching line is worth showing; the rest is one long minified line. */
+@@ -78,6 +79,7 @@ export async function searchComputeFileContents(
+         readonly lineNumbers?: boolean;
+         readonly offset?: number;
+         readonly limit: number;
++        readonly strictRoot?: boolean;
+     },
+ ): Promise<ComputeContentMatches> {
+     const permissions = computePermissionsForContext(ctx);
+@@ -90,6 +92,7 @@ export async function searchComputeFileContents(
+         options.filePattern === undefined ? undefined : globToRegExp(options.filePattern);
+     const walked = await walkComputeFiles(compute.fs, permissions, root, {
+         respectGitIgnore: true,
++        ...(options.strictRoot ? { strictRoot: true } : {}),
+     });
+     const type = normalizeFileType(options.type);
+     const wanted = walked.files.filter(
+@@ -111,6 +114,7 @@ export async function searchComputeFileContents(
+     let matchedFiles = 0;
+     let matchCount = 0;
+     let outputTruncated = false;
++    let ioIncomplete = walked.ioIncomplete;
+     let contentFiles = 0;
+     for (const file of wanted) {
+         if (ctx.lifetime?.aborted === true) throw new Error("Search aborted.");
+@@ -128,11 +132,16 @@ export async function searchComputeFileContents(
+                 continue;
+             }
+             content = new TextDecoder().decode(bytes);
+-        } catch {
++        } catch (error) {
++            if (options.strictRoot) {
++                if (file.path === root) throw error;
++                ioIncomplete = true;
++            }
+             outputTruncated = true;
+             continue;
+         }
+         if (content.length > MAX_SEARCHED_FILE_CHARACTERS || content.includes("\u0000")) {
++            if (options.strictRoot && file.path === root) outputTruncated = true;
+             continue;
+         }
+         const lines = content.split(/\r?\n/);
+@@ -183,6 +192,7 @@ export async function searchComputeFileContents(
+         matchedFiles,
+         matchCount,
+         truncated: walked.truncated || outputTruncated || offset + shown.length < rawMatches.length,
++        ...(ioIncomplete ? { ioIncomplete } : {}),
+     };
+ }
+ 
+diff --git a/packages/happy-agent-modules/sources/compute/impl/walkComputeFiles.ts b/packages/happy-agent-modules/sources/compute/impl/walkComputeFiles.ts
+index 7bf482a..e4c1bfd 100644
+--- a/packages/happy-agent-modules/sources/compute/impl/walkComputeFiles.ts
++++ b/packages/happy-agent-modules/sources/compute/impl/walkComputeFiles.ts
+@@ -19,6 +19,7 @@ export interface WalkedTree {
+     readonly files: readonly WalkedFile[];
+     /** The walk stopped at a limit, so a file it never reached may still match. */
+     readonly truncated: boolean;
++    readonly ioIncomplete?: true;
+ }
+ 
+ /** Directories whose contents are never what a search is looking for. */
+@@ -51,7 +52,7 @@ export async function walkComputeFiles(
+     fs: ComputeFileSystem,
+     permissions: ComputePermissions,
+     root: string,
+-    options: { respectGitIgnore?: boolean } = {},
++    options: { respectGitIgnore?: boolean; strictRoot?: boolean } = {},
+ ): Promise<WalkedTree> {
+     // A root that is itself a file is the whole walk. Treating it as a directory read a
+     // directory listing off a file, which failed, which read as an empty tree — and a search
+@@ -65,7 +66,8 @@ export async function walkComputeFiles(
+                 truncated: false,
+             };
+         }
+-    } catch {
++    } catch (error) {
++        if (options.strictRoot) throw error;
+         // A root that cannot be inspected walks as the empty tree it always was.
+     }
+     const files: WalkedFile[] = [];
+@@ -81,6 +83,7 @@ export async function walkComputeFiles(
+     ];
+     let visited = 0;
+     let truncated = false;
++    let ioIncomplete: true | undefined;
+     while (directories.length > 0) {
+         const entry = directories.shift();
+         if (entry === undefined) break;
+@@ -95,7 +98,12 @@ export async function walkComputeFiles(
+             );
+             names = page.names;
+             if (page.incomplete) truncated = true;
+-        } catch {
++        } catch (error) {
++            if (options.strictRoot) {
++                if (directory === root) throw error;
++                truncated = true;
++                ioIncomplete = true;
++            }
+             // A directory that cannot be read is one the search simply does not cover.
+             continue;
+         }
+@@ -113,9 +121,17 @@ export async function walkComputeFiles(
+         const stats = await fs.lstatMany(permissions, paths);
+         for (const [index, path] of paths.entries()) {
+             visited += 1;
+-            if (visited > MAX_VISITED_ENTRIES) return { files, truncated: true };
++            if (visited > MAX_VISITED_ENTRIES)
++                return { files, truncated: true, ...(ioIncomplete ? { ioIncomplete } : {}) };
+             const stat = stats[index];
+-            if (stat === undefined || stat.isSymbolicLink) continue;
++            if (stat === undefined) {
++                if (options.strictRoot) {
++                    truncated = true;
++                    ioIncomplete = true;
++                }
++                continue;
++            }
++            if (stat.isSymbolicLink) continue;
+             if (stat.isDirectory) {
+                 if (
+                     !SKIPPED_DIRECTORIES.has(sorted[index] ?? "") &&
+@@ -130,10 +146,11 @@ export async function walkComputeFiles(
+             }
+             if (respectGitIgnore && isGitIgnored(path, false, currentScopes)) continue;
+             files.push({ path, mtimeMs: stat.mtimeMs, size: stat.size });
+-            if (files.length >= MAX_COLLECTED_FILES) return { files, truncated: true };
++            if (files.length >= MAX_COLLECTED_FILES)
++                return { files, truncated: true, ...(ioIncomplete ? { ioIncomplete } : {}) };
+         }
+     }
+-    return { files, truncated };
++    return { files, truncated, ...(ioIncomplete ? { ioIncomplete } : {}) };
+ }
+ 
+ /**
+diff --git a/packages/happy-agent-modules/sources/compute/tools/claude/Grep.ts b/packages/happy-agent-modules/sources/compute/tools/claude/Grep.ts
+index cd0c58c..6e20712 100644
+--- a/packages/happy-agent-modules/sources/compute/tools/claude/Grep.ts
++++ b/packages/happy-agent-modules/sources/compute/tools/claude/Grep.ts
+@@ -34,14 +34,20 @@ const CLAUDE_GREP_DESCRIPTION = `A powerful search tool for file contents
+ `;
+ 
+ /** Claude's `Grep`: matching lines, matching files, or a count per file. */
+-export function claudeGrepTool(compute: Compute) {
++export function claudeGrepTool(compute: Compute, surface: "claude" | "codex" = "claude") {
++    const codex = surface === "codex";
++    const defaultEntries = codex ? 20 : DEFAULT_ENTRY_LIMIT;
++    const maxEntries = codex ? 100 : MAX_COMPUTE_SEARCH_LIMIT;
++    const maxOutput = codex ? 8_000 : MAX_OUTPUT_CHARACTERS;
+     return defineAgentTool({
+         name: "Grep",
+         defer: false,
+         capabilities: [
+             "Read and modify files, run shell commands, inspect images, and manage background processes.",
+         ],
+-        description: CLAUDE_GREP_DESCRIPTION,
++        description: codex
++            ? 'Prefer this read-only tool to shell grep/rg for text search. Pass a narrow file or directory path and an optional glob. Use "files_with_matches" to locate files, "content" for matching lines, or "count" for counts. Start with a small head_limit and refine the search if the result is incomplete.'
++            : CLAUDE_GREP_DESCRIPTION,
+         parameters: Type.Object(
+             {
+                 pattern: Type.String({
+@@ -50,7 +56,7 @@ export function claudeGrepTool(compute: Compute) {
+                 path: Type.Optional(
+                     Type.String({
+                         description:
+-                            "File or directory to search in. Defaults to current working directory.",
++                            "Literal file or directory to search in. Defaults to current working directory.",
+                     }),
+                 ),
+                 glob: Type.Optional(
+@@ -105,7 +111,9 @@ export function claudeGrepTool(compute: Compute) {
+                 ),
+                 head_limit: Type.Optional(
+                     Type.Number({
+-                        description: `Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to ${String(DEFAULT_ENTRY_LIMIT)} when unspecified. Pass 0 to remove the entry limit; the character and line-length limits still apply.`,
++                        description: codex
++                            ? `Limit output to first N entries in any mode. Defaults to ${String(defaultEntries)}; the maximum is ${String(maxEntries)}.`
++                            : `Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to ${String(defaultEntries)} when unspecified. Pass 0 to remove the entry limit; the character and line-length limits still apply.`,
+                     }),
+                 ),
+                 offset: Type.Optional(
+@@ -129,6 +137,7 @@ export function claudeGrepTool(compute: Compute) {
+                 matched_files: Type.Integer(),
+                 match_count: Type.Integer(),
+                 truncated: Type.Boolean(),
++                io_incomplete: Type.Optional(Type.Literal(true)),
+             },
+             exact,
+         ),
+@@ -145,7 +154,7 @@ export function claudeGrepTool(compute: Compute) {
+             // `-C` and `context` are the same request written two ways, and either of them sets
+             // both sides unless the model asked for one side on its own.
+             const contextLines = args.context ?? args["-C"];
+-            const requestedEntries = args.head_limit ?? DEFAULT_ENTRY_LIMIT;
++            const requestedEntries = args.head_limit ?? defaultEntries;
+             const found = await searchComputeFileContents(compute, ctx, {
+                 pattern: args.pattern,
+                 ...(args.path === undefined ? {} : { path: args.path }),
+@@ -157,22 +166,39 @@ export function claudeGrepTool(compute: Compute) {
+                 before: args["-B"] ?? contextLines ?? 0,
+                 after: args["-A"] ?? contextLines ?? 0,
+                 lineNumbers: args["-n"] ?? true,
++                ...(codex ? { strictRoot: true } : {}),
+                 offset: Math.min(Math.max(0, args.offset ?? 0), MAX_COMPUTE_SEARCH_OFFSET),
+-                limit:
+-                    requestedEntries <= 0
+-                        ? MAX_COMPUTE_SEARCH_LIMIT
+-                        : Math.min(requestedEntries, MAX_COMPUTE_SEARCH_LIMIT),
++                limit: requestedEntries <= 0 ? maxEntries : Math.min(requestedEntries, maxEntries),
+             });
+             const bounded = boundOutputText(found.matches.join("\n"), {
+-                maxCharacters: MAX_OUTPUT_CHARACTERS,
++                maxCharacters: maxOutput,
+             });
++            const truncated = found.truncated || bounded.truncated;
++            let text = found.matches.length === 0 ? "No matches found" : bounded.text;
++            if (codex) {
++                if (found.ioIncomplete) {
++                    const notice =
++                        "Search could not read one or more paths; results are incomplete.";
++                    text = found.matches.length === 0 ? notice : `${text}\n${notice}`;
++                } else if (found.matches.length === 0) {
++                    text = truncated
++                        ? "Search incomplete; no matches were returned."
++                        : found.matchCount > 0
++                          ? "No results in this page."
++                          : "No matches found.";
++                } else if (truncated) {
++                    text += "\nSearch output is incomplete or capped.";
++                }
++            }
+             return {
+-                text: found.matches.length === 0 ? "No matches found" : bounded.text,
++                text,
+                 matched_files: found.matchedFiles,
+                 match_count: found.matchCount,
+-                truncated: found.truncated || bounded.truncated,
++                truncated,
++                ...(found.ioIncomplete ? { io_incomplete: true as const } : {}),
+             };
+         },
+         toLLM: (result) => [{ type: "text", text: result.text }],
++        isError: (result) => result.io_incomplete === true,
+     });
+ }
+diff --git a/packages/happy-agent-modules/sources/compute/tools/codex/assembleCodexComputeTools.ts b/packages/happy-agent-modules/sources/compute/tools/codex/assembleCodexComputeTools.ts
+index 3f2d85d..2faa813 100644
+--- a/packages/happy-agent-modules/sources/compute/tools/codex/assembleCodexComputeTools.ts
++++ b/packages/happy-agent-modules/sources/compute/tools/codex/assembleCodexComputeTools.ts
+@@ -3,6 +3,7 @@ import type { AnyAgentTool } from "@slopus/happy-agent-base";
+ import type { ChatMediaModule } from "../../../chatMedia/index.js";
+ import type { Compute } from "../../Compute.js";
+ import type { FileReadLog } from "../../../impl/FileReadLog.js";
++import { claudeGrepTool } from "../claude/Grep.js";
+ import { codexApplyPatchTool } from "./apply_patch.js";
+ import { codexExecCommandTool } from "./exec_command.js";
+ import { codexKillSessionTool } from "./kill_session.js";
+@@ -10,7 +11,7 @@ import { codexViewImageTool } from "./view_image.js";
+ import { codexWriteStdinTool } from "./write_stdin.js";
+ 
+ /**
+- * Codex's filesystem and shell surface, in Codex's own order.
++ * Codex's filesystem and shell surface, followed by CyberFi's structured file search.
+  *
+  * A fixed array, written out. Nothing here inspects a name, asks what the model supports, or
+  * filters the list: what a Codex model can do is exactly what this array says.
+@@ -27,5 +28,6 @@ export function assembleCodexComputeTools(
+         codexKillSessionTool(compute),
+         codexApplyPatchTool(compute, reads),
+         codexViewImageTool(compute, reads, chatMedia),
++        claudeGrepTool(compute, "codex"),
+     ];
+ }
+diff --git a/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts b/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
+index 1cb061b..627214e 100644
+--- a/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
++++ b/packages/happy-agent-modules/sources/systemPrompt/impl/assembleEnvironmentPrompt.ts
+@@ -45,6 +45,8 @@ export function assembleEnvironmentPrompt(options: {
+                   "- Use PowerShell syntax: $env:NAME = 'value' for environment variables; & 'C:\\Program Files\\tool.exe' for a quoted executable; -LiteralPath for file operations. Separate commands with newlines. PowerShell 5.1 does not support &&, ||, export, or Bash heredocs. Check $LASTEXITCODE after native programs before continuing dependent work.",
+                   "- Run Node package managers through their Windows command shims, for example npm.cmd, npx.cmd, and pnpm.cmd. PowerShell can resolve the bare names to .ps1 wrappers that the current execution policy blocks. Preserve the user's execution policy.",
+                   "- For BOM-less UTF-8 files on Windows PowerShell, use Get-Content -LiteralPath with -Encoding UTF8. If a file or a native tool uses a different known encoding, select it explicitly and keep the original bytes intact.",
++                  "- For shell rg searches, pass a literal file or directory and use -g for globs. Read $LASTEXITCODE immediately after rg: 0 means matches, 1 means no matches, 2 means a search error. Preserve real errors.",
++                  "- When package.json pins pnpm, use the project's version via corepack.cmd pnpm when available. Run the targeted test before attempting a dependency reinstall.",
+                   "- Start background helpers with Start-Process -WindowStyle Hidden unless the user needs a visible window. Keep filesystem operations in one shell and verify the resolved target before recursive deletion or moving files.",
+               ]
+             : []),
+diff --git a/packages/happy-agent-modules/tests/compute/ComputeModule.test.ts b/packages/happy-agent-modules/tests/compute/ComputeModule.test.ts
+index a29b1d3..b2d52f7 100644
+--- a/packages/happy-agent-modules/tests/compute/ComputeModule.test.ts
++++ b/packages/happy-agent-modules/tests/compute/ComputeModule.test.ts
+@@ -137,6 +137,7 @@ describe("ComputeModule", () => {
+             "kill_session",
+             "apply_patch",
+             "view_image",
++            "Grep",
+         ]);
+ 
+         const grok = await computeToolset(ctx, new FakeCompute(), { model: "xai/grok-4.5" });
+diff --git a/packages/happy-agent-modules/tests/compute/codex/codexComputeToolSurface.test.ts b/packages/happy-agent-modules/tests/compute/codex/codexComputeToolSurface.test.ts
+index f775ded..65cd546 100644
+--- a/packages/happy-agent-modules/tests/compute/codex/codexComputeToolSurface.test.ts
++++ b/packages/happy-agent-modules/tests/compute/codex/codexComputeToolSurface.test.ts
+@@ -1,6 +1,6 @@
+ import { Value } from "@sinclair/typebox/value";
+ import { createRootContext } from "@steve.kite/stdlib";
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it, vi } from "vitest";
+ 
+ import { FakeCompute } from "../support/FakeCompute.js";
+ import { computeToolset } from "../support/computeTools.js";
+@@ -80,7 +80,7 @@ function parameterShape(tool: { readonly parameters?: unknown }): {
+ }
+ 
+ describe("codex compute tool surface", () => {
+-    it("offers exactly Codex's tools, in Codex's order", async () => {
++    it("adds typed Grep after Codex's existing tools", async () => {
+         const { tools } = await machine();
+ 
+         expect(tools.map((tool) => tool.name)).toEqual([
+@@ -89,12 +89,96 @@ describe("codex compute tool surface", () => {
+             "kill_session",
+             "apply_patch",
+             "view_image",
++            "Grep",
+         ]);
+         for (const tool of tools) {
+             expect(tool.description ?? "").not.toBe("");
+         }
+     });
+ 
++    it("reports a complete no-match without a shell or an error", async () => {
++        const { compute, tool, call } = await machine();
++        const grep = tool("Grep");
++        compute.write("/workspace/src/a.ts", "const value = 1;");
++        const result = await grep.execute(
++            ctx,
++            { pattern: "needle", path: "src", glob: "*.ts" },
++            call,
++        );
++        expect(result).toEqual({
++            text: "No matches found.",
++            matched_files: 0,
++            match_count: 0,
++            truncated: false,
++        });
++        expect(grep.isError?.(result)).toBe(false);
++        expect(grep.toLLM(result)).toEqual([{ type: "text", text: "No matches found." }]);
++        expect(compute.sessions).toHaveLength(0);
++        expect(await grep.shouldReviewInAutoMode({ pattern: "x", path: "src" }, ctx)).toBe(false);
++        expect(await grep.shouldReviewInAutoMode({ pattern: "x", path: "/etc" }, ctx)).toBe(true);
++        expect(
++            await grep.shouldRunInFullAccessInAutoMode?.({ pattern: "x", path: "/etc" }, ctx),
++        ).toBe(true);
++    });
++
++    it("does not label a bounded or paged result as a complete no-match", async () => {
++        const { compute, tool, call } = await machine();
++        const grep = tool("Grep");
++        compute.write("/workspace/src/a.ts", "needle");
++        compute.write("/workspace/src/b.ts", "needle");
++        compute.write("/workspace/too-large.txt", "a".repeat(1_000_001));
++
++        const capped = await grep.execute(
++            ctx,
++            { pattern: "needle", path: "src", head_limit: 1 },
++            call,
++        );
++        expect(capped).toMatchObject({ match_count: 2, truncated: true });
++        expect(grep.isError?.(capped)).toBe(false);
++        expect(grep.toLLM(capped)).toEqual([
++            { type: "text", text: "/workspace/src/a.ts\nSearch output is incomplete or capped." },
++        ]);
++        const beyond = await grep.execute(ctx, { pattern: "needle", path: "src", offset: 4 }, call);
++        expect(beyond.text).toBe("No results in this page.");
++        const incomplete = await grep.execute(
++            ctx,
++            { pattern: "needle", path: "too-large.txt" },
++            call,
++        );
++        expect(incomplete).toMatchObject({
++            text: "Search incomplete; no matches were returned.",
++            truncated: true,
++        });
++        expect(grep.isError?.(incomplete)).toBe(false);
++    });
++
++    it("keeps bad paths and partial I/O failures distinguishable from no-match", async () => {
++        const { compute, tool, call } = await machine();
++        const grep = tool("Grep");
++        compute.write("/workspace/src/a.ts", "needle");
++        compute.write("/workspace/src/b.ts", "needle");
++        await expect(
++            grep.execute(ctx, { pattern: "needle", path: "missing.ts" }, call),
++        ).rejects.toThrow("No such path");
++        const read = compute.fs.readFileBuffer;
++        vi.spyOn(compute.fs, "readFileBuffer").mockImplementation((permissions, path, options) => {
++            if (path === "/workspace/src/b.ts") return Promise.reject(new Error("Access denied"));
++            return read(permissions, path, options);
++        });
++        await expect(
++            grep.execute(ctx, { pattern: "needle", path: "src/b.ts" }, call),
++        ).rejects.toThrow("Access denied");
++        const partial = await grep.execute(ctx, { pattern: "needle", path: "src" }, call);
++        expect(partial).toMatchObject({ io_incomplete: true, match_count: 1, truncated: true });
++        expect(grep.isError?.(partial)).toBe(true);
++        expect(grep.toLLM(partial)).toEqual([
++            {
++                type: "text",
++                text: "/workspace/src/a.ts\nSearch could not read one or more paths; results are incomplete.",
++            },
++        ]);
++    });
++
+     it("matches the vendor's argument shape wherever it offers the field", async () => {
+         const { tool } = await machine();
+ 
+diff --git a/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts b/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
+index 6d795c2..4307cd0 100644
+--- a/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
++++ b/packages/happy-agent-modules/tests/systemPrompt/SystemPromptWindows.test.ts
+@@ -29,6 +29,10 @@ describe("native Windows command guidance", () => {
+             expect(prompt).toContain("npm.cmd, npx.cmd, and pnpm.cmd");
+             expect(prompt).toContain("Preserve the user's execution policy");
+             expect(prompt).toContain("Get-Content -LiteralPath with -Encoding UTF8");
++            expect(prompt).toContain("use -g for globs");
++            expect(prompt).toContain("Read $LASTEXITCODE immediately after rg");
++            expect(prompt).toContain("1 means no matches, 2 means a search error");
++            expect(prompt).toContain("corepack.cmd pnpm");
+             expect(prompt).toContain("Start-Process -WindowStyle Hidden");
+             expect(prompt).not.toContain("- Shell: /bin/bash");
+             expect(prompt).not.toContain("- Shell: C:\\Program Files\\Git");

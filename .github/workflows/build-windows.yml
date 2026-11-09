@@ -166,6 +166,10 @@ jobs:
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   pnpm --filter @slopus/happy-agent-modules exec vitest run tests/mcp/McpProtocolServerNames.test.ts tests/mcp/McpModule.test.ts tests/systemPrompt/SystemPromptWindows.test.ts tests/compute/impl/readComputeTextFile.test.ts tests/compute/claude/claudeComputeSurface.test.ts tests/compute/grok/grokComputeToolSurface.test.ts tests/mcp/McpToolSerialization.test.ts tests/mcp/McpResultCornerCases.test.ts tests/search tests/compute/CyberFiCommandToolReadPolicy.test.ts tests/compute/CyberFiCommandToolsReady.test.ts --maxWorkers=2
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Verify Codex structured search and Shell command compatibility
+              run: |
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/compute/codex/codexComputeToolSurface.test.ts tests/compute/codex/codexComputeCommandTools.test.ts --maxWorkers=2
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Verify human Full access inheritance and queued human restrictions
               run: |
                   pnpm --filter @slopus/happy-agent-modules exec vitest run tests/collaboration/CollaborationModule.test.ts tests/subtasks/SubtaskPermissionModes.test.ts -t 'collaborator permission modes|subtask permission modes' --maxWorkers=2
