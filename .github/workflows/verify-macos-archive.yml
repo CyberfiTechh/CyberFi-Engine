@@ -22,11 +22,17 @@ jobs:
           - runner: macos-26
             target: darwin-arm64
             architecture: arm64
-            bytes: 193764762
-            sha256: dcfdd8ff878176b35e89951741080426a8a852b915093865707ad4b69b90b361
-            sidecar_sha256: 38d4929186ec4ea1beb6969b61926eb97cef8587e885b5e033b5c309a654da50
+            bytes: 193764784
+            sha256: cada750ee255a91ff8daeb620f73a34fa5d92f71c0a41decc29b3bb3e1da07f8
+            sidecar_sha256: 8162fe2a96255314471b71f63fd05e6e42dde21f3993a644a5b67f3f6c4b2ae4
+          - runner: macos-15-intel
+            target: darwin-x64
+            architecture: x86_64
+            bytes: 204619634
+            sha256: a94f2280f7a8646cdc866c5496d4644c9a44f343d17096ab1de65c804bb04c00
+            sidecar_sha256: 21c8e5af24acfe50585d40e9e556713c061fd8232d3252070f181834c21e276f
     env:
-      ENGINE_VERSION: 0.4.123-preview.1
+      ENGINE_VERSION: 0.4.123
       TARGET: ${{ matrix.target }}
       TARGET_ARCH: ${{ matrix.architecture }}
       ASSET_SIZE: ${{ matrix.bytes }}
