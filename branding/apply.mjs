@@ -51,7 +51,7 @@ export function brandedStatusIcon(original, png) {
   const animation = original.slice(original.indexOf('struct StatusIconAnimation {'));
   if (!animation.startsWith('struct StatusIconAnimation {')) throw Error('Missing pinned animation');
   return `import AppKit
-/// Approved CyberFi spiral and circuitry; full color retains its white gaps.
+/// Approved CyberFi spiral and circuitry, including the transparent channel.
 enum StatusIcon {
     private static let size = NSSize(width: 20, height: 20)
     // Phase slots retain the existing animation and reduced-motion contract.
@@ -97,6 +97,9 @@ export function apply(platform, directory) {
   const workspaceArchive = join(here, 'workspace-archive.patch');
   execFileSync('git', ['-C', root, 'apply', '--check', workspaceArchive]);
   execFileSync('git', ['-C', root, 'apply', workspaceArchive]);
+  const eventsBuffer = join(here, 'events-buffer-eviction.patch');
+  execFileSync('git', ['-C', root, 'apply', '--check', eventsBuffer]);
+  execFileSync('git', ['-C', root, 'apply', eventsBuffer]);
   const native = join(root, 'packages/happy-agent-modules/sources/menuBar/native');
   const changes = [];
   if (platform === 'win32') {

@@ -41,7 +41,7 @@ if (process.argv[4] !== '--source-only') {
 }
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(here, 'asset-manifest.json')));
-assert.equal(manifest.sourceSha256, 'd576b97d3d7821d05d8647e0f52af64ff8a6d0d8e83e6bbb281d81aacd85e461');
+assert.equal(manifest.sourceSha256, '268cdefb00290ace912dd686126e0d82c6b87aef1b7ed15397193782cb7a9ec5');
 const png = readFileSync(join(here, 'CyberFi-tray.png'));
 const ico = readFileSync(join(here, '../windows/CyberFi.ico'));
 assert.equal(hash(png), manifest.pngSha256); assert.equal(hash(ico), manifest.icoSha256);

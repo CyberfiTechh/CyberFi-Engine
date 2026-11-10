@@ -1,0 +1,25 @@
+diff --git a/packages/happy-agent-modules/sources/events/EventsModule.ts b/packages/happy-agent-modules/sources/events/EventsModule.ts
+index 6a26719..90f5f3a 100644
+--- a/packages/happy-agent-modules/sources/events/EventsModule.ts
++++ b/packages/happy-agent-modules/sources/events/EventsModule.ts
+@@ -118,9 +118,9 @@ export class EventsModule implements AgentModule<AnyAgentTool> {
+     readonly name = "events";
+     readonly migrations = eventsMigrations;
+     /**
+-     * The retained window is `#buffer` from `#head` on. Leaving the front only advances `#head`,
+-     * and the dead prefix is cut once it is as long as the window, so dropping the oldest event on
+-     * every append costs nothing like shifting ten thousand entries each time.
++     * The retained window is `#buffer` from `#head` on. Dropping an event releases its payload
++     * immediately and leaves a hole in the unused prefix. Cutting the prefix only when it is as
++     * long as the window avoids shifting ten thousand entries on every append.
+      */
+     readonly #buffer: AgentEvent[] = [];
+     #head = 0;
+@@ -973,6 +973,7 @@ export class EventsModule implements AgentModule<AnyAgentTool> {
+             ) {
+                 this.#latestByAgent.delete(removed.agentId);
+             }
++            delete this.#buffer[index];
+         }
+         this.#dropped += end - this.#head;
+         this.#head = end;
