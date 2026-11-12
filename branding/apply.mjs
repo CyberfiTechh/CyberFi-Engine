@@ -74,7 +74,7 @@ enum StatusIcon {
 ${animation}`;
 }
 export function apply(platform, directory) {
-  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.126';
+  const releaseVersion = process.env.HAPPY_AGENT_RELEASE_VERSION ?? '0.4.127';
   if (releaseVersion.trim() !== releaseVersion || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-preview\.(0|[1-9]\d*))?$/.test(releaseVersion) || releaseVersion.split('-')[0].split('.').some(part => Number(part) > 65535)) throw Error('Invalid native engine release version');
   const assemblyVersion = releaseVersion.split('-')[0] + '.0';
   const root = resolve(directory);
@@ -227,4 +227,7 @@ export function apply(platform, directory) {
   for (const [path, text] of changes) writeFileSync(path, text, 'utf8');
   for (const fixture of ['smoke-command-tools.mjs', 'smoke-mcp-deep.mjs', 'mcp-deep-catalog.json.gz'])
     copyFileSync(join(here, fixture), join(root, 'packages/happy-agent/scripts', fixture));
+  const workspacePlan = join(here, 'workspace-plan.patch');
+  execFileSync('git', ['-C', root, 'apply', '--check', workspacePlan]);
+  execFileSync('git', ['-C', root, 'apply', workspacePlan]);
 }

@@ -1,0 +1,2903 @@
+diff --git a/packages/happy-agent-client/sources/HappyAgentClient.ts b/packages/happy-agent-client/sources/HappyAgentClient.ts
+index e0a1c2e..d456780 100644
+--- a/packages/happy-agent-client/sources/HappyAgentClient.ts
++++ b/packages/happy-agent-client/sources/HappyAgentClient.ts
+@@ -106,6 +106,7 @@ import type {
+     UpdateSurfaceRequest,
+     SurfaceId,
+     SurfaceListResponse,
++    SurfaceListQuery,
+     SurfaceMemberRequest,
+     SurfaceResponse,
+     SurfaceChatResponse,
+@@ -1984,8 +1985,15 @@ export class HappyAgentClient {
+     // Surfaces
+ 
+     /** `GET /v0/surfaces` — shared catalog, with members nested in each Surface. */
+-    async listSurfaces(options: RequestOptions = {}): Promise<SurfaceListResponse> {
+-        return await this.#json({ method: "GET", path: "v0/surfaces", signal: options.signal });
++    async listSurfaces(
++        options: RequestOptions & SurfaceListQuery = {},
++    ): Promise<SurfaceListResponse> {
++        return await this.#json({
++            method: "GET",
++            path: "v0/surfaces",
++            signal: options.signal,
++            query: { coordinatorAgentId: options.coordinatorAgentId },
++        });
+     }
+ 
+     async createSurface(
+diff --git a/packages/happy-agent-client/sources/protocol/agents.ts b/packages/happy-agent-client/sources/protocol/agents.ts
+index f5fe020..5fab163 100644
+--- a/packages/happy-agent-client/sources/protocol/agents.ts
++++ b/packages/happy-agent-client/sources/protocol/agents.ts
+@@ -247,11 +247,39 @@ export interface FailureResolutionResponse {
+ }
+ 
+ /** `GET /v0/agents/:agentId/activity` — everything the agent set in motion. */
++export const subagentExecutionSchema = Type.Object({
++    modelId: Nullable(Type.String()),
++    latestRun: Nullable(
++        Type.Object({
++            id: cuid2Schema,
++            status: Type.Union([
++                Type.Literal("running"),
++                Type.Literal("completed"),
++                Type.Literal("aborted"),
++                Type.Literal("failed"),
++            ]),
++            reason: Nullable(
++                Type.Union([
++                    Type.Literal("completed"),
++                    Type.Literal("steering"),
++                    Type.Literal("abort"),
++                    Type.Literal("error"),
++                ]),
++            ),
++            startedAt: timestampSchema,
++            endedAt: Nullable(timestampSchema),
++        }),
++    ),
++});
++export type SubagentExecution = Static<typeof subagentExecutionSchema>;
++
+ export interface AgentActivityResponse {
+     /** Full agent objects, newest first, finished ones included. */
+     subagents: Agent[];
+     /** Full process objects, newest first, exited ones included. */
+     processes: BackgroundProcess[];
++    /** Metadata only; a completed run does not verify the coordinator's task. */
++    subagentExecution?: Record<Cuid2, SubagentExecution>;
+ }
+ 
+ /** `POST /v0/agents` — creates a parentless, user-controlled workspace root. */
+diff --git a/packages/happy-agent-client/sources/protocol/bootstrap.ts b/packages/happy-agent-client/sources/protocol/bootstrap.ts
+index 6e5c03b..399e17e 100644
+--- a/packages/happy-agent-client/sources/protocol/bootstrap.ts
++++ b/packages/happy-agent-client/sources/protocol/bootstrap.ts
+@@ -7,6 +7,7 @@ import {
+     type AgentDraftResponse,
+     type AgentModeResponse,
+     type AgentResponse,
++    type SubagentExecution,
+     agentSchema,
+ } from "./agents.js";
+ import { botSchema } from "./bots.js";
+@@ -41,6 +42,8 @@ export interface AgentBootstrapResponse
+     processes?: BackgroundProcess[];
+     /** Full child-agent activity, newest first. Absent on older compatible daemons. */
+     subagents?: Agent[];
++    /** Metadata-only child execution snapshots; absent on older daemons. */
++    subagentExecution?: Record<string, SubagentExecution>;
+     cursor: EventCursor;
+ }
+ 
+diff --git a/packages/happy-agent-client/sources/protocol/events.ts b/packages/happy-agent-client/sources/protocol/events.ts
+index 3e3f324..86a6561 100644
+--- a/packages/happy-agent-client/sources/protocol/events.ts
++++ b/packages/happy-agent-client/sources/protocol/events.ts
+@@ -70,6 +70,7 @@ import {
+     surfaceMessageStatusSchema,
+     surfaceMessageTextSchema,
+     todoSchema,
++    todoExecutionSchema,
+     todoTextSchema,
+     type SurfaceDocumentLiveFrame,
+ } from "./surfaces.js";
+@@ -301,6 +302,7 @@ export const todoUpdatedPayloadSchema = Type.Object({
+     changes: Type.Object({
+         completedAt: Type.Optional(Nullable(timestampSchema)),
+         deletedAt: Type.Optional(Nullable(timestampSchema)),
++        execution: Type.Optional(todoExecutionSchema),
+         orderKey: Type.Optional(Nullable(surfaceOrderKeySchema)),
+         status: Type.Optional(
+             Type.Union([
+diff --git a/packages/happy-agent-client/sources/protocol/surfaces.ts b/packages/happy-agent-client/sources/protocol/surfaces.ts
+index 7f9824b..8d5ba93 100644
+--- a/packages/happy-agent-client/sources/protocol/surfaces.ts
++++ b/packages/happy-agent-client/sources/protocol/surfaces.ts
+@@ -123,6 +123,12 @@ export const surfaceListResponseSchema = Type.Object({
+ });
+ export type SurfaceListResponse = Static<typeof surfaceListResponseSchema>;
+ 
++/** Known optional catalog filter; unrelated query fields remain ignored by the route. */
++export const surfaceListQuerySchema = Type.Object({
++    coordinatorAgentId: Type.Optional(surfaceIdSchema),
++});
++export type SurfaceListQuery = Static<typeof surfaceListQuerySchema>;
++
+ export const surfaceResponseSchema = Type.Object({
+     surface: surfaceSchema,
+ });
+@@ -290,10 +296,128 @@ export const todoTextSchema = Type.String({
+     pattern: "^(?=[\\s\\S]*\\S)[^\\x00-\\x08\\x0b-\\x1f\\x7f]+$",
+ });
+ 
++export const todoExecutionPhaseSchema = Type.Union([
++    Type.Literal("pending"),
++    Type.Literal("in_progress"),
++    Type.Literal("awaiting_input"),
++    Type.Literal("blocked"),
++    Type.Literal("verifying"),
++    Type.Literal("completed"),
++    Type.Literal("failed"),
++    Type.Literal("cancelled"),
++]);
++export type TodoExecutionPhase = Static<typeof todoExecutionPhaseSchema>;
++
++const todoDependenciesSchema = Type.Array(cuid2Schema, { maxItems: 64, uniqueItems: true });
++export const todoExecutionEvidenceSchema = Type.Union([
++    Type.Object({
++        kind: Type.Literal("agent_message"),
++        agentId: cuid2Schema,
++        messageId: cuid2Schema,
++    }),
++    Type.Object({ kind: Type.Literal("artifact"), artifactId: cuid2Schema }),
++]);
++export type TodoExecutionEvidence = Static<typeof todoExecutionEvidenceSchema>;
++const todoEvidenceListSchema = Type.Array(
++    Type.Union([
++        Type.Object(todoExecutionEvidenceSchema.anyOf[0].properties, {
++            additionalProperties: false,
++        }),
++        Type.Object(todoExecutionEvidenceSchema.anyOf[1].properties, {
++            additionalProperties: false,
++        }),
++    ]),
++    {
++        maxItems: 64,
++        uniqueItems: true,
++    },
++);
++
++/** Optional durable execution; actor checks and run/evidence integrity are daemon-owned. */
++export const todoExecutionSchema = Type.Object({
++    coordinatorAgentId: cuid2Schema,
++    projectId: Type.Optional(cuid2Schema),
++    assigneeAgentId: Type.Optional(cuid2Schema),
++    phase: todoExecutionPhaseSchema,
++    dependsOn: todoDependenciesSchema,
++    attempt: Type.Object({
++        id: cuid2Schema,
++        runId: Type.Optional(cuid2Schema),
++        startedAt: Type.Optional(timestampSchema),
++        finishedAt: Type.Optional(timestampSchema),
++    }),
++    evidence: Type.Array(todoExecutionEvidenceSchema, { maxItems: 64, uniqueItems: true }),
++    verification: Type.Optional(
++        Type.Object({
++            userId: Nullable(userIdSchema),
++            agentId: Nullable(cuid2Schema),
++            acceptedAt: timestampSchema,
++        }),
++    ),
++});
++export type TodoExecution = Static<typeof todoExecutionSchema>;
++
++export const createTodoExecutionSchema = Type.Object(
++    {
++        coordinatorAgentId: cuid2Schema,
++        projectId: Type.Optional(cuid2Schema),
++        dependsOn: Type.Optional(todoDependenciesSchema),
++    },
++    { additionalProperties: false },
++);
++export type CreateTodoExecution = Static<typeof createTodoExecutionSchema>;
++
++const todoExecutionEdits = {
++    assigneeAgentId: Nullable(cuid2Schema),
++    phase: todoExecutionPhaseSchema,
++    runId: cuid2Schema,
++    dependsOn: todoDependenciesSchema,
++    evidence: todoEvidenceListSchema,
++};
++const optionalTodoExecutionEdits = {
++    assigneeAgentId: Type.Optional(todoExecutionEdits.assigneeAgentId),
++    phase: Type.Optional(todoExecutionEdits.phase),
++    runId: Type.Optional(todoExecutionEdits.runId),
++    dependsOn: Type.Optional(todoExecutionEdits.dependsOn),
++    evidence: Type.Optional(todoExecutionEdits.evidence),
++};
++const todoExecutionEditSchema = Type.Union([
++    Type.Object(
++        { ...optionalTodoExecutionEdits, assigneeAgentId: todoExecutionEdits.assigneeAgentId },
++        { additionalProperties: false },
++    ),
++    Type.Object(
++        { ...optionalTodoExecutionEdits, phase: todoExecutionEdits.phase },
++        { additionalProperties: false },
++    ),
++    Type.Object(
++        { ...optionalTodoExecutionEdits, runId: todoExecutionEdits.runId },
++        { additionalProperties: false },
++    ),
++    Type.Object(
++        { ...optionalTodoExecutionEdits, dependsOn: todoExecutionEdits.dependsOn },
++        { additionalProperties: false },
++    ),
++    Type.Object(
++        { ...optionalTodoExecutionEdits, evidence: todoExecutionEdits.evidence },
++        { additionalProperties: false },
++    ),
++]);
++const todoExecutionRetrySchema = Type.Object(
++    { retry: Type.Literal(true) },
++    { additionalProperties: false },
++);
++export const updateTodoExecutionSchema = Type.Union([
++    todoExecutionEditSchema,
++    todoExecutionRetrySchema,
++]);
++export type UpdateTodoExecution = Static<typeof updateTodoExecutionSchema>;
++
+ const todoFields = {
+     /** Immutable author, distinct from revision actors. Older daemons omit it. */
+     authorUserId: Type.Optional(Nullable(userIdSchema)),
+     createdAt: timestampSchema,
++    execution: Type.Optional(todoExecutionSchema),
+     id: cuid2Schema,
+     surfaceId: surfaceIdSchema,
+     text: todoTextSchema,
+@@ -374,6 +498,7 @@ export type TodoVersionResponse = Static<typeof todoVersionResponseSchema>;
+ 
+ export const createTodoRequestSchema = Type.Object(
+     {
++        execution: Type.Optional(createTodoExecutionSchema),
+         id: Type.Optional(cuid2Schema),
+         mutationId: Type.Optional(mutationIdSchema),
+         text: todoTextSchema,
+@@ -386,6 +511,7 @@ export type CreateTodoRequest = Static<typeof createTodoRequestSchema>;
+ export const updateTodoRequestSchema = Type.Union([
+     Type.Object(
+         {
++            execution: Type.Optional(todoExecutionEditSchema),
+             status: Type.Optional(todoStatusSchema),
+             mutationId: Type.Optional(mutationIdSchema),
+             text: todoTextSchema,
+@@ -394,12 +520,31 @@ export const updateTodoRequestSchema = Type.Union([
+     ),
+     Type.Object(
+         {
++            execution: Type.Optional(todoExecutionEditSchema),
+             status: todoStatusSchema,
+             mutationId: Type.Optional(mutationIdSchema),
+             text: Type.Optional(todoTextSchema),
+         },
+         { additionalProperties: false },
+     ),
++    Type.Object(
++        {
++            execution: todoExecutionEditSchema,
++            status: Type.Optional(todoStatusSchema),
++            mutationId: Type.Optional(mutationIdSchema),
++            text: Type.Optional(todoTextSchema),
++        },
++        { additionalProperties: false },
++    ),
++    Type.Object(
++        {
++            execution: todoExecutionRetrySchema,
++            mutationId: Type.String({ minLength: 1, maxLength: 256 }),
++            text: Type.Optional(Type.Never()),
++            status: Type.Optional(Type.Never()),
++        },
++        { additionalProperties: false },
++    ),
+ ]);
+ export type UpdateTodoRequest = Static<typeof updateTodoRequestSchema>;
+ 
+diff --git a/packages/happy-agent-client/tests/subagentExecutionProtocol.test.ts b/packages/happy-agent-client/tests/subagentExecutionProtocol.test.ts
+new file mode 100644
+index 0000000..4f576cb
+--- /dev/null
++++ b/packages/happy-agent-client/tests/subagentExecutionProtocol.test.ts
+@@ -0,0 +1,53 @@
++import { Value } from "@sinclair/typebox/value";
++import { expect, expectTypeOf, it } from "vitest";
++import {
++    subagentExecutionSchema,
++    type AgentActivityResponse,
++    type SubagentExecution,
++} from "../sources/protocol/agents.js";
++import type { AgentBootstrapResponse } from "../sources/protocol/bootstrap.js";
++
++it("keeps child execution optional on old activity and focused snapshots", () => {
++    const old: AgentActivityResponse = { subagents: [], processes: [] };
++    expect(old.subagentExecution).toBeUndefined();
++    expectTypeOf<AgentBootstrapResponse["subagentExecution"]>().toEqualTypeOf<
++        Record<string, SubagentExecution> | undefined
++    >();
++    expect(Value.Check(subagentExecutionSchema, { modelId: null, latestRun: null })).toBe(true);
++});
++
++it.each(["running", "completed", "aborted", "failed"])(
++    "accepts authoritative %s metadata",
++    (status) => {
++        const summary = {
++            modelId: "openai/gpt-6.1-sol",
++            latestRun: {
++                id: "run1",
++                status,
++                reason:
++                    status === "running"
++                        ? null
++                        : status === "completed"
++                          ? "completed"
++                          : status === "aborted"
++                            ? "abort"
++                            : "error",
++                startedAt: 100,
++                endedAt: status === "running" ? null : 200,
++            },
++        };
++        expect(Value.Check(subagentExecutionSchema, summary)).toBe(true);
++        expect(
++            Value.Check(subagentExecutionSchema, {
++                ...summary,
++                latestRun: { ...summary.latestRun, status: "idle" },
++            }),
++        ).toBe(false);
++        expect(
++            Value.Check(subagentExecutionSchema, {
++                ...summary,
++                latestRun: { ...summary.latestRun, endedAt: "200" },
++            }),
++        ).toBe(false);
++    },
++);
+diff --git a/packages/happy-agent-client/tests/todoExecutionProtocol.test.ts b/packages/happy-agent-client/tests/todoExecutionProtocol.test.ts
+new file mode 100644
+index 0000000..a2d6e14
+--- /dev/null
++++ b/packages/happy-agent-client/tests/todoExecutionProtocol.test.ts
+@@ -0,0 +1,211 @@
++import { Value } from "@sinclair/typebox/value";
++import { describe, expect, it } from "vitest";
++import { HappyAgentClient } from "../sources/HappyAgentClient.js";
++
++import { todoUpdatedPayloadSchema } from "../sources/protocol/events.js";
++import {
++    createTodoRequestSchema,
++    todoExecutionSchema,
++    todoRevisionSchema,
++    todoSchema,
++    updateTodoRequestSchema,
++    surfaceListQuerySchema,
++    type TodoExecution,
++} from "../sources/protocol/surfaces.js";
++
++const execution: TodoExecution = {
++    coordinatorAgentId: "coordinator",
++    projectId: "project",
++    assigneeAgentId: "child",
++    phase: "verifying",
++    dependsOn: ["dependency"],
++    attempt: { id: "attempt", runId: "run", startedAt: 100, finishedAt: 150 },
++    evidence: [{ kind: "agent_message", agentId: "child", messageId: "message" }],
++};
++const todo = {
++    id: "todo",
++    surfaceId: "s".repeat(24),
++    authorUserId: null,
++    text: "Check the result",
++    status: "active",
++    orderKey: "5",
++    createdAt: 100,
++    updatedAt: 150,
++    completedAt: null,
++    deletedAt: null,
++    version: "version",
++};
++
++describe("optional Todo execution protocol", () => {
++    it("filters Surface discovery by a single real-format coordinator without breaking unfiltered reads", async () => {
++        const coordinatorAgentId = "c".repeat(24);
++        expect(Value.Check(surfaceListQuerySchema, {})).toBe(true);
++        expect(Value.Check(surfaceListQuerySchema, { coordinatorAgentId })).toBe(true);
++        for (const invalid of [
++            "",
++            "short",
++            "C".repeat(24),
++            `${coordinatorAgentId}\n`,
++            [coordinatorAgentId, coordinatorAgentId],
++        ]) {
++            expect(Value.Check(surfaceListQuerySchema, { coordinatorAgentId: invalid })).toBe(
++                false,
++            );
++        }
++        const requests: { url: string; signal: AbortSignal | null | undefined }[] = [];
++        const client = new HappyAgentClient({
++            endpoint: "http://agent.local",
++            token: "test",
++            fetch: async (input, init) => {
++                requests.push({ url: input.toString(), signal: init?.signal });
++                return new Response(JSON.stringify({ surfaces: [], cursor: "cursor" }), {
++                    status: 200,
++                });
++            },
++        });
++        const controller = new AbortController();
++        await client.listSurfaces();
++        await client.listSurfaces({ coordinatorAgentId, signal: controller.signal });
++        expect(requests.map((request) => request.url)).toEqual([
++            "http://agent.local/v0/surfaces",
++            `http://agent.local/v0/surfaces?coordinatorAgentId=${coordinatorAgentId}`,
++        ]);
++        expect(requests[1]?.signal).toBe(controller.signal);
++    });
++    it("preserves plain Todo reads, writes and permanent revisions", () => {
++        expect(Value.Check(todoSchema, todo)).toBe(true);
++        expect(Value.Check(createTodoRequestSchema, { text: "Plain" })).toBe(true);
++        expect(Value.Check(updateTodoRequestSchema, { status: "completed" })).toBe(true);
++        for (const snapshot of [todo, { ...todo, execution }]) {
++            expect(
++                Value.Check(todoRevisionSchema, {
++                    todo: snapshot,
++                    actor: { agentId: null, userId: null },
++                    source: "api",
++                }),
++            ).toBe(true);
++        }
++        for (const variant of todoSchema.anyOf) {
++            expect(variant.required).not.toContain("execution");
++        }
++    });
++
++    it("carries full execution in snapshots and events while allowing additive responses", () => {
++        expect(Value.Check(todoSchema, { ...todo, execution })).toBe(true);
++        expect(
++            Value.Check(todoUpdatedPayloadSchema, {
++                surfaceId: todo.surfaceId,
++                todoId: todo.id,
++                previousVersion: "previous",
++                version: todo.version,
++                changes: { execution, updatedAt: todo.updatedAt },
++            }),
++        ).toBe(true);
++        expect(
++            Value.Check(todoExecutionSchema, {
++                ...execution,
++                futureField: true,
++                evidence: [{ kind: "artifact", artifactId: "artifact", futureField: true }],
++            }),
++        ).toBe(true);
++        for (const phase of [
++            "pending",
++            "in_progress",
++            "awaiting_input",
++            "blocked",
++            "verifying",
++            "completed",
++            "failed",
++            "cancelled",
++        ]) {
++            expect(Value.Check(todoExecutionSchema, { ...execution, phase })).toBe(true);
++        }
++        expect(Value.Check(todoExecutionSchema, { ...execution, phase: "idle" })).toBe(false);
++    });
++
++    it("accepts creation and non-empty execution edits but rejects server-owned fields", () => {
++        expect(
++            Value.Check(createTodoRequestSchema, {
++                text: "Task",
++                execution: { coordinatorAgentId: "main", projectId: "project", dependsOn: [] },
++            }),
++        ).toBe(true);
++        for (const patch of [
++            { assigneeAgentId: "child" },
++            { assigneeAgentId: null },
++            { phase: "blocked" },
++            { runId: "run", phase: "in_progress" },
++            { dependsOn: [] },
++            { evidence: [{ kind: "artifact", artifactId: "artifact" }] },
++        ]) {
++            expect(Value.Check(updateTodoRequestSchema, { execution: patch })).toBe(true);
++        }
++        for (const patch of [
++            {},
++            { coordinatorAgentId: "other" },
++            { projectId: "other" },
++            { attempt: { id: "forged" } },
++            { startedAt: 1 },
++            { finishedAt: 2 },
++            { verification: { agentId: "child", userId: null, acceptedAt: 2 } },
++            { phase: "working" },
++            { evidence: [{ kind: "path", path: "secret.txt" }] },
++            { evidence: [{ kind: "artifact", artifactId: "artifact", acceptedAt: 1 }] },
++        ]) {
++            expect(Value.Check(updateTodoRequestSchema, { execution: patch })).toBe(false);
++        }
++        for (const field of ["phase", "attempt", "verification", "assigneeAgentId"]) {
++            expect(
++                Value.Check(createTodoRequestSchema, {
++                    text: "Task",
++                    execution: { coordinatorAgentId: "main", [field]: "forged" },
++                }),
++            ).toBe(false);
++        }
++    });
++
++    it("bounds distinct dependencies and evidence before runtime reference checks", () => {
++        for (const dependsOn of [
++            ["same", "same"],
++            Array.from({ length: 65 }, (_, i) => `todo${i}`),
++        ]) {
++            expect(Value.Check(updateTodoRequestSchema, { execution: { dependsOn } })).toBe(false);
++        }
++        const evidence = { kind: "artifact", artifactId: "artifact" };
++        expect(
++            Value.Check(updateTodoRequestSchema, {
++                execution: { evidence: [evidence, evidence] },
++            }),
++        ).toBe(false);
++        expect(
++            Value.Check(updateTodoRequestSchema, {
++                execution: {
++                    evidence: Array.from({ length: 65 }, (_, i) => ({
++                        ...evidence,
++                        artifactId: `${i}`,
++                    })),
++                },
++            }),
++        ).toBe(false);
++    });
++
++    it("isolates retry with an explicit receipt key and no forged attempt or mixed edits", () => {
++        expect(
++            Value.Check(updateTodoRequestSchema, {
++                execution: { retry: true },
++                mutationId: "retry-1",
++            }),
++        ).toBe(true);
++        for (const request of [
++            { execution: { retry: true } },
++            { execution: { retry: true }, mutationId: "" },
++            { execution: { retry: true }, mutationId: "x".repeat(257) },
++            { execution: { retry: false }, mutationId: "retry-1" },
++            { execution: { retry: true, phase: "pending" }, mutationId: "retry-1" },
++            { execution: { retry: true }, mutationId: "retry-1", text: "Mixed" },
++            { execution: { retry: true }, mutationId: "retry-1", status: "active" },
++        ]) {
++            expect(Value.Check(updateTodoRequestSchema, request)).toBe(false);
++        }
++    });
++});
+diff --git a/packages/happy-agent-gym-tests/package.json b/packages/happy-agent-gym-tests/package.json
+index a320b42..021cf21 100644
+--- a/packages/happy-agent-gym-tests/package.json
++++ b/packages/happy-agent-gym-tests/package.json
+@@ -12,7 +12,7 @@
+     "devDependencies": {
+         "@modelcontextprotocol/sdk": "^1.29.0",
+         "@sinclair/typebox": "^0.34.49",
+-        "@slopus/happy-agent-client": "0.0.151",
++        "@slopus/happy-agent-client": "workspace:*",
+         "@slopus/happy-agent-gym": "workspace:*",
+         "@types/node": "^24.0.10",
+         "@types/ws": "8.18.1",
+diff --git a/packages/happy-agent-gym/package.json b/packages/happy-agent-gym/package.json
+index dfcf2a2..35a58ea 100644
+--- a/packages/happy-agent-gym/package.json
++++ b/packages/happy-agent-gym/package.json
+@@ -18,7 +18,7 @@
+         "@sinclair/typebox": "^0.34.49",
+         "@slopus/happy-agent": "workspace:*",
+         "@slopus/happy-agent-base": "npm:@slopus/happy-agent-base@0.0.67",
+-        "@slopus/happy-agent-client": "0.0.151",
++        "@slopus/happy-agent-client": "workspace:*",
+         "@slopus/happy-agent-compute": "npm:@slopus/happy-agent-compute@0.1.30",
+         "@slopus/happy-agent-modules": "workspace:*",
+         "@slopus/happy-providers": "0.0.53",
+diff --git a/packages/happy-agent-modules/package.json b/packages/happy-agent-modules/package.json
+index 473eb98..8765a9e 100644
+--- a/packages/happy-agent-modules/package.json
++++ b/packages/happy-agent-modules/package.json
+@@ -76,7 +76,7 @@
+         "@sinclair/typebox": "^0.34.49",
+         "@slopus/ghostty-wasm": "1.3.6",
+         "@slopus/ghostty-web": "0.1.3",
+-        "@slopus/happy-agent-client": "0.0.151",
++        "@slopus/happy-agent-client": "workspace:*",
+         "@slopus/happy-agent-compute": "npm:@slopus/happy-agent-compute@0.1.30",
+         "@slopus/happy-providers": "0.0.53",
+         "@steve.kite/stdlib": "0.0.12",
+diff --git a/packages/happy-agent-modules/sources/api/ApiModule.ts b/packages/happy-agent-modules/sources/api/ApiModule.ts
+index 31a8da0..654f468 100644
+--- a/packages/happy-agent-modules/sources/api/ApiModule.ts
++++ b/packages/happy-agent-modules/sources/api/ApiModule.ts
+@@ -5925,18 +5925,38 @@ export class ApiModule implements AgentModule {
+             throw notFound("The agent was not found.");
+         }
+         const children = await agents.childOf(ctx, agentId);
+-        return {
+-            subagents: await Promise.all(
+-                [...children].reverse().map(async (childId) => {
+-                    const [agent, usage] = await Promise.all([
+-                        this.#requireAgentResource(ctx, childId),
+-                        this.#usage.readAgent(ctx, childId),
+-                    ]);
+-                    return {
++        const childSnapshots = await Promise.all(
++            [...children].reverse().map(async (childId) => {
++                const [agent, usage, run, config] = await Promise.all([
++                    this.#requireAgentResource(ctx, childId),
++                    this.#usage.readAgent(ctx, childId),
++                    this.#history.latestRun(ctx, childId),
++                    agents.config(ctx, childId),
++                ]);
++                const mode = config === undefined ? null : agentModeFromConfig(config);
++                return {
++                    id: childId,
++                    agent: {
+                         ...agent,
+                         totalTokens: usage.inferenceCount === 0 ? null : usage.totalTokens,
+-                    };
+-                }),
++                    },
++                    execution: {
++                        modelId: Value.Check(messageModeSchema, mode) ? mode.modelId : null,
++                        latestRun: run === undefined ? null : {
++                            id: run.id,
++                            status: run.status,
++                            reason: run.reason,
++                            startedAt: run.startedAt,
++                            endedAt: run.endedAt,
++                        },
++                    },
++                };
++            }),
++        );
++        return {
++            subagents: childSnapshots.map((child) => child.agent),
++            subagentExecution: Object.fromEntries(
++                childSnapshots.map((child) => [child.id, child.execution]),
+             ),
+             processes: await this.#compute.listProcesses(ctx, agentId),
+         };
+@@ -6772,8 +6792,18 @@ export class ApiModule implements AgentModule {
+         try {
+             if (url.pathname === "/v0/surfaces") {
+                 if (request.method === "GET") {
++                    const coordinators = url.searchParams.getAll("coordinatorAgentId");
++                    if (
++                        coordinators.length > 1 ||
++                        (coordinators[0] !== undefined &&
++                            !Value.Check(surfaceIdSchema, coordinators[0]))
++                    )
++                        throw invalidRequest("The Surface coordinator filter is invalid.");
+                     const cursor = this.#journal.cursor();
+-                    sendJson(response, 200, { surfaces: await surfaces.list(ctx), cursor });
++                    sendJson(response, 200, {
++                        surfaces: await surfaces.list(ctx, coordinators[0]),
++                        cursor,
++                    });
+                     return true;
+                 }
+                 if (request.method === "POST") {
+@@ -7083,6 +7113,11 @@ export class ApiModule implements AgentModule {
+                 }
+                 if (request.method === "POST") {
+                     const body = await bodyAs(request, createTodoRequestSchema, "todo creation");
++                    if (body.execution !== undefined)
++                        await this.#assertUserControlledAgent(
++                            ctx,
++                            body.execution.coordinatorAgentId,
++                        );
+                     sendJson(response, 201, {
+                         todo: await surfaces.createTodo(ctx, surfaceId, body, actor, actor.userId),
+                     });
+@@ -7129,13 +7164,25 @@ export class ApiModule implements AgentModule {
+             }
+             if (selectedVersion !== undefined) return false;
+             const current = await surfaces.getTodo(ctx, surfaceId, todoId);
+-            const version = requireIfMatch(request, current.version, {
+-                currentVersion: current.version,
+-                todo: current,
+-            });
++            if (current.execution !== undefined)
++                await this.#assertUserControlledAgent(ctx, current.execution.coordinatorAgentId);
++            const edit =
++                request.method === "PATCH" && action === undefined
++                    ? await bodyAs(request, updateTodoRequestSchema, "todo update")
++                    : undefined;
++            const retry = edit?.execution !== undefined && "retry" in edit.execution;
++            // Durable retry receipts must resolve before the old optimistic version is rejected.
++            const version = requireIfMatch(
++                request,
++                retry ? request.headers["if-match"] : current.version,
++                {
++                    currentVersion: current.version,
++                    todo: current,
++                },
++            );
+             let todo;
+             if (request.method === "PATCH" && action === undefined) {
+-                const body = await bodyAs(request, updateTodoRequestSchema, "todo update");
++                const body = edit!;
+                 todo = await surfaces.mutateTodo(
+                     ctx,
+                     surfaceId,
+diff --git a/packages/happy-agent-modules/sources/api/LEARNINGS.md b/packages/happy-agent-modules/sources/api/LEARNINGS.md
+index 59e6262..c06f4d8 100644
+--- a/packages/happy-agent-modules/sources/api/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/api/LEARNINGS.md
+@@ -1,5 +1,13 @@
+ # API module learnings
+ 
++## Child activity includes compact execution facts
++
++Native child status describes current work, so `idle` cannot distinguish success, failure, abort,
++or an agent that never ran. Activity and focused bootstrap now carry optional per-child lifecycle
++metadata from History's indexed latest-run reader and the child's configured model. They do not
++read transcripts, infer queue counts, or label the coordinator's task verified. Existing run
++events keep clients current; old daemons may omit the additional snapshot.
++
+ ## A shared public listener does not merge credential authority
+ 
+ The public endpoint was initially treated as another phone-only transport. It now serves ordinary
+diff --git a/packages/happy-agent-modules/sources/bots/LEARNINGS.md b/packages/happy-agent-modules/sources/bots/LEARNINGS.md
+index 30f7840..0ba9b6c 100644
+--- a/packages/happy-agent-modules/sources/bots/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/bots/LEARNINGS.md
+@@ -1,5 +1,14 @@
+ # Bots — learnings
+ 
++## Coordination keeps the relevant context and waits for native reports
++
++Repeated status questions and copied full histories add model work without advancing a task.
++Chief of Staff guidance now uses a compact brief, scoped child context, bounded reads and evidence
++references, and waits for automatic completion reports where the runtime supplies them. It keeps
++the latest user constraints and checks results before claiming completion. These are prompt
++defaults, not runtime context limits or measured performance gains; native task, subtask and
++research-agent identities and permissions remain unchanged.
++
+ ## The Stories switch updates the bot without renaming it
+ 
+ Bot PATCH accepts a name, a Stories switch, or both. A stories-only edit leaves the name,
+diff --git a/packages/happy-agent-modules/sources/bots/impl/formatChiefOfStaffInstructions.ts b/packages/happy-agent-modules/sources/bots/impl/formatChiefOfStaffInstructions.ts
+index fed57e4..fe6fecd 100644
+--- a/packages/happy-agent-modules/sources/bots/impl/formatChiefOfStaffInstructions.ts
++++ b/packages/happy-agent-modules/sources/bots/impl/formatChiefOfStaffInstructions.ts
+@@ -12,6 +12,22 @@ const CHIEF_OF_STAFF_INSTRUCTIONS = [
+     "",
+     "Coordinate specialized bots when delegation creates durable value. Check the existing bot roster before creating another bot, give each bot a focused ongoing responsibility, and follow up on delegated work instead of treating delegation as completion.",
+     "",
++    "Before delegating substantial work, prepare a compact working brief: the user's goal and requested outputs, scope and exclusions, latest constraints, relevant project and verified sources, acceptance criteria, and unresolved blockers. Keep it subordinate to the user's request and permissions; a brief is not new authority. Show a short actionable plan, not private reasoning. For a simple question, answer directly without creating an unnecessary team or plan.",
++    "",
++    "For substantial multi-step work, keep the visible plan in real Surface todos. Discover list_surfaces with coordinatorAgentId set to your executing agent ID below and reuse its todo Surface; if none exists, create_todo_surface only when that tool is offered and authorized. Create items through create_todo with execution.coordinatorAgentId equal to your executing agent ID, existing same-plan dependency IDs, and a verified projectId only when this coordinator belongs to that project. Do not substitute the bot ID, a model name, or a transcript checklist.",
++    "",
++    "Update those items through update_todo as actual work changes: assign the real child agent ID, bind its real runId when known, and report phase from actual progress or delivered reports without polling children. Move work through verifying; accept completed only after checking its acceptance criteria and attaching existing agent-message or artifact evidence, with dependencies verified. Failed, cancelled, idle, or merely archived agents are not completed work. Use execution:{retry:true} only for an intentional new attempt; transport retries retain the tool's stable retry identity (HTTP retries reuse their mutationId). Keep all existing permissions and tool discovery boundaries.",
++    "",
++    "Give each delegated task only the context it needs: its task identity, deliverable, assigned files or workspace, dependencies, applicable rules with source and revision when available, acceptance checks, and reporting expectations. Keep other agents' work intact and coordinate ownership before concurrent edits. Do not copy the entire conversation, every skill, or other agents' raw logs into each opening message. Preserve the existing distinction between persistent tasks, user-visible subtasks, and internal research agents.",
++    "",
++    "Choose a model from the current agent_options and the permissions actually offered for that task. Select by the required tools, context, verified capabilities and the user's speed or cost preferences, not by a role name alone. Reuse suitable existing agents and known current options; refresh options when they change or a selection fails. Do not invent tools, widen permissions, or switch paid accounts to make a delegation work.",
++    "",
++    "Use the runtime's existing completion and failure reports when it promises automatic delivery. Do not repeatedly ask an active child for status or read its full history while waiting for that report. Send an intermediate message only for a material finding, blocker, changed requirement, or necessary steering. Where automatic reporting is not provided, arrange one concise result report through the existing messaging tools. Let independent work proceed instead of creating a polling loop.",
++    "",
++    "Keep reads and reports bounded. Verify paths first, search the relevant files, and read only the needed ranges; reuse findings while their source is unchanged. Keep full non-secret command output or test evidence in an authorized local file when needed, and return the exit status, relevant excerpt, and an exact evidence reference. Clearly disclose omitted output and retrieve its relevant detail when necessary. Do not silently truncate evidence, hide an actual failure, expose credentials in logs, or repeat an unchanged failing command without a reason it can now succeed.",
++    "",
++    "Ask collaborators for concise results: outcome, changed files, checks and evidence, unresolved issues, and the next action. Verify the acceptance criteria before reporting completion; a child saying done is not proof. Preserve the latest user corrections, scope, permissions, durable rule references, pending work and evidence references in working summaries so follow-up work can resume without rereading every log. Report what actually passed and what was not checked. Do not claim measured token savings, speedups, or runtime context-budget enforcement from these instructions alone.",
++    "",
+     "When asked to create or import a project, check list_projects first to avoid duplicates. Use create_project to register an existing local folder; for a brand-new project, create its folder with the shell within the user's permission boundaries first, then register it. Use clone_project for GitHub repositories (owner/name) or other HTTPS Git remotes such as GitLab and Bitbucket. Git uses the authentication configured on the machine that runs it; never request or embed raw credentials in a tool argument or URL. These tools create local Happy projects, not remote repositories. Follow background setup through list_projects and confirm readiness before creating workspaces or delegating work there. If setup fails, report the actual error and resolve missing access within the user's authority. If project tools are unavailable, explain the limitation instead of bypassing it through the shell or API.",
+     "",
+     "Before planning or carrying out a task, check the recipe documents in docs/recipe for relevant guidance. Resolve recipe/ beside the Happy Agent documentation README path supplied in your environment, not relative to your bot workspace; in a source checkout the directory is docs/recipe. Read every relevant recipe in full and use it to guide the work, including its setup questions and completion checks. Recipes are guidance, not authorization: respect the user's choices, permission boundaries, and credential privacy. If the directory is unavailable or no recipe applies, say so briefly and continue using the available documentation and your best judgment.",
+@@ -21,7 +37,7 @@ const CHIEF_OF_STAFF_INSTRUCTIONS = [
+ 
+ /** Combine the bot's live identity with the current built-in Chief of Staff guidance. */
+ export function formatChiefOfStaffInstructions(
+-    bot: Pick<BotRecord, "id" | "name" | "username">,
++    bot: Pick<BotRecord, "id" | "name" | "username" | "agentId">,
+ ): string {
+-    return `${formatBotIdentityPrompt(bot)}\n\n${CHIEF_OF_STAFF_INSTRUCTIONS}`;
++    return `${formatBotIdentityPrompt(bot)}\n\nExecuting coordinator agent ID: \`${bot.agentId}\`\n\n${CHIEF_OF_STAFF_INSTRUCTIONS}`;
+ }
+diff --git a/packages/happy-agent-modules/sources/history/HistoryModule.ts b/packages/happy-agent-modules/sources/history/HistoryModule.ts
+index a6d81fb..94ea9dc 100644
+--- a/packages/happy-agent-modules/sources/history/HistoryModule.ts
++++ b/packages/happy-agent-modules/sources/history/HistoryModule.ts
+@@ -1026,6 +1026,22 @@ export class HistoryModule implements AgentModule {
+         );
+     }
+ 
++    /** Newest durable lifecycle metadata only; never loads transcript rows. */
++    async latestRun(ctx: Context, agentId: string): Promise<HistoryRunState | undefined> {
++        if (!Value.Check(historyAgentIdSchema, agentId)) {
++            throw new Error("The history module received an invalid latest-run lookup.");
++        }
++        const rows = await agentDatabaseRows<HistoryRunRow>(
++            ctx.db,
++            sql`SELECT agent_id, sequence, run_id, status, reason, started_at, ended_at
++                FROM ${sql.raw(HISTORY_RUNS_TABLE)}
++                WHERE agent_id = ${agentId}
++                ORDER BY sequence DESC
++                LIMIT 1`,
++        );
++        return rows[0] === undefined ? undefined : runStateFromRow(rows[0]);
++    }
++
+     /** Read one exact run's lifecycle state, including a run that has no messages. */
+     async run(ctx: Context, agentId: string, runId: string): Promise<HistoryRunState | undefined> {
+         if (
+diff --git a/packages/happy-agent-modules/sources/history/LEARNINGS.md b/packages/happy-agent-modules/sources/history/LEARNINGS.md
+index 6802c81..3f9a06a 100644
+--- a/packages/happy-agent-modules/sources/history/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/history/LEARNINGS.md
+@@ -1,5 +1,12 @@
+ # History learnings
+ 
++## Activity reads lifecycle metadata without transcript pages
++
++An idle child does not prove successful completion, and reading its whole last run to discover
++the outcome can load arbitrarily large message payloads. `latestRun` reads only the newest durable
++lifecycle row using the agent/sequence index, including message-less runs. Consumers preserve its
++actual outcome and server times; run completion does not verify a coordinator's task.
++
+ ## Spawn identity belongs to the durable call before its result
+ 
+ Result-only presentations arrive too late to name a sub-agent while it is being created. History
+diff --git a/packages/happy-agent-modules/sources/runtime/startHappyAgentRuntime.ts b/packages/happy-agent-modules/sources/runtime/startHappyAgentRuntime.ts
+index 1c5f684..455b55d 100644
+--- a/packages/happy-agent-modules/sources/runtime/startHappyAgentRuntime.ts
++++ b/packages/happy-agent-modules/sources/runtime/startHappyAgentRuntime.ts
+@@ -590,6 +590,9 @@ export async function startHappyAgentRuntime(
+             compute.computeModule,
+             config,
+             runners,
++            history,
++            projects,
++            workspaces,
+         );
+         const surfaceAutoJoin = new SurfaceAutoJoinModule(
+             surfaces,
+diff --git a/packages/happy-agent-modules/sources/surfaces/LEARNINGS.md b/packages/happy-agent-modules/sources/surfaces/LEARNINGS.md
+index 9a7ee8e..ec17fa1 100644
+--- a/packages/happy-agent-modules/sources/surfaces/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/surfaces/LEARNINGS.md
+@@ -1,5 +1,15 @@
+ # Surfaces learnings
+ 
++## Execution plans remain Todo data with verifiable transitions
++
++CyberFi task boards use optional Todo execution data, not Task conversation archive state or
++transcript parsing. Coordinators own assignment, dependencies and acceptance; assigned children
++only report their own progress and existing evidence. Run timestamps come from History, and a
++durable settlement update freezes elapsed time without declaring the task completed. Retry
++receipts, revisions and per-coordinator Surface indexes commit with the head and notification,
++so a repeated stale retry cannot create another attempt and a deleted item cannot leave a live
++board entry. Plain todos keep their existing contract.
++
+ ## Default membership must respect deliberate departures
+ 
+ Team members now join new and existing catalog Surfaces by default through the independent
+diff --git a/packages/happy-agent-modules/sources/surfaces/SurfacesModule.ts b/packages/happy-agent-modules/sources/surfaces/SurfacesModule.ts
+index cfe5d44..8790bc0 100644
+--- a/packages/happy-agent-modules/sources/surfaces/SurfacesModule.ts
++++ b/packages/happy-agent-modules/sources/surfaces/SurfacesModule.ts
+@@ -43,6 +43,9 @@ import {
+     type Todo,
+     type TodoRevision,
+     type TodoListScope,
++    type TodoExecution,
++    type CreateTodoExecution,
++    type UpdateTodoExecution,
+     type SurfaceDocumentChangeListResponse,
+     type SurfaceDocumentRevision,
+     type SurfaceDocumentStateResponse,
+@@ -60,6 +63,9 @@ import { TasksModule } from "../tasks/index.js";
+ import { ArtifactsModule } from "../artifacts/index.js";
+ import { ComputeModule } from "../compute/index.js";
+ import { ConfigModule } from "../config/index.js";
++import { HistoryModule } from "../history/index.js";
++import { ProjectsModule } from "../projects/index.js";
++import { WorkspacesModule } from "../workspaces/index.js";
+ import type { RunnersModule } from "../runners/index.js";
+ import { apiResourceVersion } from "../utils/apiResourceVersion.js";
+ import { isUserOriginMetadata } from "../impl/messageOrigin.js";
+@@ -189,6 +195,9 @@ export class SurfacesModule implements AgentModule {
+         readonly compute: ComputeModule,
+         readonly config: ConfigModule,
+         readonly runners: RunnersModule,
++        readonly history?: HistoryModule,
++        readonly projects?: ProjectsModule,
++        readonly workspaces?: WorkspacesModule,
+     ) {
+         this.vaults = new SurfaceVaults(durable, config);
+         durable.register({
+@@ -211,6 +220,15 @@ export class SurfacesModule implements AgentModule {
+                 return null;
+             },
+         });
++        durable.register({
++            name: "surfaces.settleExecution",
++            argumentsSchema: Type.Object({ agentId: cuid2Schema }),
++            resultSchema: Type.Null(),
++            executor: async (ctx, call) => {
++                await this.#settleExecution(ctx, call.arguments.agentId);
++                return null;
++            },
++        });
+     }
+     readonly beforeStart = (ctx: Context, agents: AgentSystemRef): AgentModuleHooks => {
+         this.#systemMonitor = new SystemMonitorSampler(ctx);
+@@ -226,6 +244,10 @@ export class SurfacesModule implements AgentModule {
+             notify: (eventCtx, event) => this.#event(eventCtx, event),
+         });
+         return {
++            afterAgentSettledTransact: (settledCtx, scope) =>
++                this.#scheduleExecutionSettlement(settledCtx, scope.agent.id),
++            agentRestoredTransact: (restoredCtx, _scope, agent) =>
++                this.#scheduleExecutionSettlement(restoredCtx, agent.id),
+             afterStart: (startCtx) => this.vaults.afterStart(startCtx),
+             instructions: async (hookCtx, scope) => {
+                 const chat = await this.chatForAgent(hookCtx, scope.agent.id);
+@@ -381,7 +403,27 @@ export class SurfacesModule implements AgentModule {
+         ).toString("base64");
+     }
+     /** The catalog as its caller sees it, with each reference target resolved for that caller. */
+-    async list(ctx: Context): Promise<Surface[]> {
++    async list(ctx: Context, coordinatorAgentId?: string): Promise<Surface[]> {
++        if (coordinatorAgentId !== undefined) {
++            checked(surfaceIdSchema, coordinatorAgentId);
++            return ctx.inTx(async (tx) => {
++                await this.#executionAgent(tx, coordinatorAgentId);
++                const index = await this.#kv.list(tx, `todo-execution.${coordinatorAgentId}.`);
++                const surfaces = await Promise.all(
++                    index.map(async ({ value }) => {
++                        const entry = checked(
++                            Type.Object({
++                                surfaceId: surfaceIdSchema,
++                                count: Type.Integer({ minimum: 1 }),
++                            }),
++                            value,
++                        );
++                        return this.get(tx, entry.surfaceId);
++                    }),
++                );
++                return surfaces.flatMap((surface) => (surface?.type === "todo" ? [surface] : []));
++            });
++        }
+         return ctx.inTx(async (tx) =>
+             Promise.all((await this.#stored(tx)).map((surface) => this.#present(tx, surface))),
+         );
+@@ -743,6 +785,17 @@ export class SurfacesModule implements AgentModule {
+                 completedAt: null,
+                 deletedAt: null,
+                 version: createUuidV7Factory()(),
++                ...(input.execution === undefined
++                    ? {}
++                    : {
++                          execution: await this.#createExecution(
++                              tx,
++                              surfaceId,
++                              id,
++                              input.execution,
++                              actor,
++                          ),
++                      }),
+             };
+             await this.#saveTodo(tx, todo, actor);
+             await this.#event(
+@@ -766,13 +819,116 @@ export class SurfacesModule implements AgentModule {
+         checked(resourceVersionSchema, version);
+         return ctx.inTx(async (tx) => {
+             const current = await this.getTodo(tx, surfaceId, id);
++            const edit =
++                operation === "update" ? checked(updateTodoRequestSchema, input) : undefined;
++            const retry = edit?.execution !== undefined && "retry" in edit.execution;
++            const receiptKey =
++                mutationId === undefined
++                    ? undefined
++                    : `todo-retry.${JSON.stringify([surfaceId, id, actor.userId, actor.agentId, mutationId])}`;
++            if (current.execution !== undefined) {
++                await this.#executionActor(tx, current.execution, actor, edit, operation);
++                if (receiptKey !== undefined) {
++                    const receipt = await this.#kv.read(tx, receiptKey);
++                    if (receipt !== undefined) {
++                        const saved = checked(
++                            Type.Object({ version: resourceVersionSchema, todo: todoSchema }),
++                            receipt,
++                        );
++                        if (
++                            !retry ||
++                            edit?.text !== undefined ||
++                            edit.status !== undefined ||
++                            saved.version !== version
++                        )
++                            throw new SurfaceError(
++                                "conflict",
++                                "The retry mutation ID belongs to another request.",
++                                { todo: current },
++                            );
++                        return saved.todo;
++                    }
++                }
++            } else if (edit?.execution !== undefined)
++                throw new SurfaceError(
++                    "invalid_request",
++                    "A plain todo cannot gain execution through an update.",
++                );
+             if (current.version !== version)
+                 throw new SurfaceError("conflict", "The todo has changed.", { todo: current });
+             let candidate = { ...current } as Todo;
+             if (operation === "update") {
+                 const edit = checked(updateTodoRequestSchema, input);
++                if (current.execution !== undefined) {
++                    if (
++                        current.status === "deleted" &&
++                        (edit.execution !== undefined ||
++                            (edit.status !== undefined && edit.status !== "deleted"))
++                    )
++                        throw new SurfaceError(
++                            "invalid_request",
++                            "A deleted execution todo cannot be reactivated.",
++                        );
++                    if (
++                        retry &&
++                        (!mutationId ||
++                            mutationId.length > 256 ||
++                            edit.text !== undefined ||
++                            edit.status !== undefined)
++                    )
++                        throw new SurfaceError(
++                            "invalid_request",
++                            "Retry requires its own mutation ID and cannot include other edits.",
++                        );
++                    if (edit.execution !== undefined)
++                        candidate.execution = await this.#updateExecution(
++                            tx,
++                            current,
++                            edit.execution,
++                            actor,
++                        );
++                    const expected =
++                        candidate.execution!.phase === "completed" ? "completed" : "active";
++                    if (
++                        edit.status !== undefined &&
++                        edit.status !== "deleted" &&
++                        (edit.status !== expected ||
++                            (edit.status === "completed" &&
++                                edit.execution === undefined &&
++                                current.status !== "completed"))
++                    )
++                        throw new SurfaceError(
++                            "invalid_request",
++                            "Execution status must follow its verified phase.",
++                        );
++                    if (
++                        edit.status !== "deleted" &&
++                        edit.execution !== undefined &&
++                        expected !== candidate.status
++                    ) {
++                        candidate =
++                            expected === "completed"
++                                ? {
++                                      ...candidate,
++                                      status: "completed",
++                                      completedAt: Date.now(),
++                                      deletedAt: null,
++                                      orderKey: null,
++                                  }
++                                : {
++                                      ...candidate,
++                                      status: "active",
++                                      completedAt: null,
++                                      deletedAt: null,
++                                      orderKey:
++                                          current.status === "active"
++                                              ? current.orderKey
++                                              : await this.#todoTail(tx, surfaceId),
++                                  };
++                    }
++                }
+                 if (edit.text !== undefined) candidate.text = edit.text;
+-                if (edit.status !== undefined && edit.status !== current.status) {
++                if (edit.status !== undefined && edit.status !== candidate.status) {
+                     if (edit.status === "active")
+                         candidate = {
+                             ...candidate,
+@@ -849,10 +1005,13 @@ export class SurfacesModule implements AgentModule {
+                         completedAt: todo.completedAt,
+                         deletedAt: todo.deletedAt,
+                         updatedAt: todo.updatedAt,
++                        ...(todo.execution === undefined ? {} : { execution: todo.execution }),
+                     },
+                     ...echo(mutationId),
+                 },
+             });
++            if (retry && receiptKey !== undefined)
++                await this.#kv.write(tx, receiptKey, { version, todo });
+             return todo;
+         });
+     }
+@@ -1350,7 +1509,361 @@ export class SurfacesModule implements AgentModule {
+             null,
+         );
+     }
++    async #executionAgent(ctx: Context, id: string, allowArchived = false): Promise<void> {
++        const config = await this.#requireAgents().config(ctx, id);
++        if (
++            config === undefined ||
++            (!allowArchived && typeof config.metadata?.["archivedAt"] === "number")
++        )
++            throw new SurfaceError("not_found", "The execution agent was not found.");
++    }
++    async #executionActor(
++        ctx: Context,
++        execution: TodoExecution,
++        actor: SurfaceActor,
++        edit?: UpdateTodoRequest,
++        operation: "update" | "reorder" | "delete" = "update",
++    ): Promise<void> {
++        await this.#executionAgent(ctx, execution.coordinatorAgentId);
++        if (actor.agentId === execution.coordinatorAgentId) return;
++        if (actor.agentId === null) {
++            if (this.team.enabled && actor.userId === null)
++                throw new SurfaceError("forbidden", "Execution requires an authenticated person.");
++            await this.#validateUser(ctx, actor.userId);
++            return;
++        }
++        const update = edit?.execution;
++        if (
++            actor.agentId !== execution.assigneeAgentId ||
++            operation !== "update" ||
++            edit?.text !== undefined ||
++            edit?.status !== undefined ||
++            update === undefined ||
++            "retry" in update ||
++            update.assigneeAgentId !== undefined ||
++            update.dependsOn !== undefined ||
++            update.phase === "pending" ||
++            update.phase === "completed"
++        )
++            throw new SurfaceError(
++                "forbidden",
++                "Only the coordinator can administer this execution.",
++            );
++        await this.#executionAssignee(ctx, execution.coordinatorAgentId, actor.agentId);
++    }
++    async #executionAssignee(
++        ctx: Context,
++        coordinator: string,
++        assignee: string,
++        allowArchived = false,
++    ): Promise<void> {
++        await this.#executionAgent(ctx, assignee, allowArchived);
++        let current: string | null = assignee;
++        for (let depth = 0; current !== null && depth < 64; depth += 1) {
++            if (current === coordinator) return;
++            current = await this.#requireAgents().parentOf(ctx, current);
++        }
++        throw new SurfaceError("not_found", "The assignee is not a child of this coordinator.");
++    }
++    async #executionDependencies(
++        ctx: Context,
++        surfaceId: string,
++        todoId: string,
++        execution: TodoExecution,
++    ): Promise<void> {
++        const pending = [...execution.dependsOn];
++        const seen = new Set<string>();
++        while (pending.length > 0) {
++            const id = pending.pop()!;
++            if (id === todoId)
++                throw new SurfaceError(
++                    "invalid_request",
++                    "Execution dependencies cannot contain a cycle.",
++                );
++            if (seen.has(id)) continue;
++            seen.add(id);
++            const dependency = await this.getTodo(ctx, surfaceId, id);
++            if (
++                dependency.status === "deleted" ||
++                dependency.execution?.coordinatorAgentId !== execution.coordinatorAgentId
++            )
++                throw new SurfaceError("not_found", "The execution dependency was not found.");
++            if (
++                execution.phase === "completed" &&
++                execution.dependsOn.includes(id) &&
++                (dependency.execution.phase !== "completed" ||
++                    dependency.execution.verification === undefined)
++            )
++                throw new SurfaceError(
++                    "invalid_request",
++                    "Execution dependencies must be verified before completion.",
++                );
++            pending.push(...dependency.execution.dependsOn);
++        }
++    }
++    async #createExecution(
++        ctx: Context,
++        surfaceId: string,
++        todoId: string,
++        input: CreateTodoExecution,
++        actor: SurfaceActor,
++    ): Promise<TodoExecution> {
++        if (actor.agentId !== null && actor.agentId !== input.coordinatorAgentId)
++            throw new SurfaceError("forbidden", "A tool must use its own agent as coordinator.");
++        const execution: TodoExecution = {
++            coordinatorAgentId: input.coordinatorAgentId,
++            ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
++            phase: "pending",
++            dependsOn: input.dependsOn ?? [],
++            attempt: { id: createId() },
++            evidence: [],
++        };
++        await this.#executionActor(ctx, execution, actor);
++        if (input.projectId !== undefined) {
++            if (this.projects === undefined || this.workspaces === undefined)
++                throw new SurfaceError(
++                    "not_initialized",
++                    "Execution project validation is unavailable.",
++                );
++            const project = await this.projects.get(ctx, input.projectId);
++            let agent: string | null = input.coordinatorAgentId;
++            let matched = false;
++            for (let depth = 0; agent !== null && depth < 64; depth += 1) {
++                const direct = await this.projects.projectForAgent(ctx, agent);
++                if (direct?.id === input.projectId) {
++                    matched = true;
++                    break;
++                }
++                const workspaceId = this.config.configuration.values.features.workspaces
++                    ? await this.workspaces.workspaceForAgent(ctx, agent)
++                    : undefined;
++                const workspace =
++                    workspaceId === undefined
++                        ? undefined
++                        : await this.workspaces.get(ctx, workspaceId);
++                if (direct?.id === input.projectId || workspace?.projectRef === input.projectId) {
++                    matched = true;
++                    break;
++                }
++                agent = await this.#requireAgents().parentOf(ctx, agent);
++            }
++            if (project === undefined || project.status !== "active" || !matched)
++                throw new SurfaceError("not_found", "The coordinator's project was not found.");
++        }
++        await this.#executionDependencies(ctx, surfaceId, todoId, execution);
++        return execution;
++    }
++    async #updateExecution(
++        ctx: Context,
++        todo: Todo,
++        edit: UpdateTodoExecution,
++        actor: SurfaceActor,
++    ): Promise<TodoExecution> {
++        const current = todo.execution!;
++        const terminal = ["completed", "failed", "cancelled"].includes(current.phase);
++        if ("retry" in edit) {
++            if (!terminal)
++                throw new SurfaceError(
++                    "invalid_request",
++                    "Only a terminal execution can be retried.",
++                );
++            const { verification: _verification, ...rest } = current;
++            return { ...rest, phase: "pending", attempt: { id: createId() }, evidence: [] };
++        }
++        if (terminal)
++            throw new SurfaceError(
++                "invalid_request",
++                "A terminal attempt can change only through retry.",
++            );
++        if (
++            current.attempt.runId !== undefined &&
++            ((edit.runId !== undefined && edit.runId !== current.attempt.runId) ||
++                (edit.assigneeAgentId !== undefined &&
++                    edit.assigneeAgentId !== current.assigneeAgentId))
++        )
++            throw new SurfaceError(
++                "invalid_request",
++                "A bound execution cannot change its run or assignee.",
++            );
++        const { verification: _verification, ...rest } = current;
++        const next: TodoExecution = {
++            ...rest,
++            phase: edit.phase ?? current.phase,
++            dependsOn: edit.dependsOn ?? current.dependsOn,
++            evidence: edit.evidence ?? current.evidence,
++            attempt: { ...current.attempt },
++        };
++        if (edit.assigneeAgentId === null) delete next.assigneeAgentId;
++        else if (edit.assigneeAgentId !== undefined) next.assigneeAgentId = edit.assigneeAgentId;
++        if (next.assigneeAgentId !== undefined)
++            await this.#executionAssignee(
++                ctx,
++                next.coordinatorAgentId,
++                next.assigneeAgentId,
++                current.assigneeAgentId === next.assigneeAgentId &&
++                    current.attempt.runId !== undefined,
++            );
++        const runId = edit.runId ?? current.attempt.runId;
++        if (runId !== undefined) {
++            if (this.history === undefined)
++                throw new SurfaceError(
++                    "not_initialized",
++                    "Execution run validation is unavailable.",
++                );
++            const run =
++                next.assigneeAgentId === undefined
++                    ? undefined
++                    : await this.history.run(ctx, next.assigneeAgentId, runId);
++            if (run === undefined)
++                throw new SurfaceError("not_found", "The assignee's run was not found.");
++            next.attempt = {
++                id: current.attempt.id,
++                runId,
++                startedAt: run.startedAt,
++                ...(run.endedAt === null ? {} : { finishedAt: run.endedAt }),
++            };
++            if (
++                ["completed", "failed", "cancelled"].includes(next.phase) &&
++                run.status === "running"
++            )
++                throw new SurfaceError(
++                    "invalid_request",
++                    "The bound run must settle before the execution.",
++                );
++        }
++        if (
++            next.phase === "in_progress" &&
++            (next.assigneeAgentId === undefined || runId === undefined)
++        )
++            throw new SurfaceError(
++                "invalid_request",
++                "An in-progress execution needs an assignee and its run.",
++            );
++        for (const evidence of next.evidence) {
++            if (evidence.kind === "artifact") {
++                if ((await this.artifacts.get(ctx, evidence.artifactId))?.status !== "active")
++                    throw new SurfaceError("not_found", "The execution artifact was not found.");
++            } else {
++                await this.#executionAgent(ctx, evidence.agentId, true);
++                if (this.history === undefined)
++                    throw new SurfaceError(
++                        "not_initialized",
++                        "Execution evidence validation is unavailable.",
++                    );
++                if (
++                    (await this.history.message(ctx, evidence.agentId, evidence.messageId)) ===
++                    undefined
++                )
++                    throw new SurfaceError("not_found", "The execution message was not found.");
++            }
++        }
++        await this.#executionDependencies(ctx, todo.surfaceId, todo.id, next);
++        if (next.phase === "completed") {
++            if (next.evidence.length === 0)
++                throw new SurfaceError("invalid_request", "Completion requires existing evidence.");
++            next.verification = { ...actor, acceptedAt: Date.now() };
++        }
++        return next;
++    }
++    async #scheduleExecutionSettlement(ctx: Context, agentId: string): Promise<void> {
++        if (this.history === undefined) return;
++        if ((await this.#kv.list(ctx, `todo-run.${agentId}.`)).length === 0) return;
++        await this.durable.invoke(ctx, {
++            function: "surfaces.settleExecution",
++            arguments: { agentId },
++            lockKeys: [`surfaces.settleExecution.${agentId}`],
++        });
++    }
++    async #settleExecution(ctx: Context, agentId: string): Promise<void> {
++        if (this.history === undefined) return;
++        await ctx.inTx(async (tx) => {
++            const pending = await this.#kv.list(tx, `todo-run.${agentId}.`);
++            for (const { value } of pending) {
++                const reference = checked(
++                    Type.Object({ surfaceId: surfaceIdSchema, todoId: cuid2Schema }),
++                    value,
++                );
++                const current = await this.getTodo(tx, reference.surfaceId, reference.todoId);
++                const execution = current.execution;
++                if (
++                    execution?.assigneeAgentId !== agentId ||
++                    execution.attempt.runId === undefined ||
++                    execution.attempt.finishedAt !== undefined ||
++                    current.status === "deleted"
++                )
++                    continue;
++                const run = await this.history!.run(tx, agentId, execution.attempt.runId);
++                if (run?.endedAt == null) continue;
++                const todo = checked(todoSchema, {
++                    ...current,
++                    execution: {
++                        ...execution,
++                        attempt: {
++                            ...execution.attempt,
++                            startedAt: run.startedAt,
++                            finishedAt: run.endedAt,
++                        },
++                    },
++                    updatedAt: Date.now(),
++                    version: createUuidV7Factory(Date.now, current.version)(),
++                });
++                await this.#saveTodo(tx, todo, { userId: null, agentId: null });
++                await this.#event(tx, {
++                    type: "todo.updated",
++                    payload: {
++                        surfaceId: todo.surfaceId,
++                        todoId: todo.id,
++                        previousVersion: current.version,
++                        version: todo.version,
++                        changes: { execution: todo.execution!, updatedAt: todo.updatedAt },
++                    },
++                });
++            }
++        });
++    }
+     async #saveTodo(ctx: Context, todo: Todo, actor: SurfaceActor): Promise<void> {
++        if (todo.execution !== undefined) {
++            const key = `todo-execution.${todo.execution.coordinatorAgentId}.${todo.surfaceId}`;
++            const prior = await this.#kv.read(ctx, `todo.${todo.surfaceId}.${todo.id}`);
++            const old = prior === undefined ? undefined : readTodo(prior);
++            const runKey = (record: Todo | undefined) =>
++                record?.execution?.attempt.runId === undefined ||
++                record.execution.assigneeAgentId === undefined
++                    ? undefined
++                    : `todo-run.${record.execution.assigneeAgentId}.${record.execution.attempt.runId}.${record.surfaceId}.${record.id}`;
++            const previousRunKey = runKey(old);
++            if (previousRunKey !== undefined) await this.#store.deleteValue(ctx, previousRunKey);
++            const nextRunKey = runKey(todo);
++            if (
++                nextRunKey !== undefined &&
++                todo.status !== "deleted" &&
++                todo.execution.attempt.finishedAt === undefined
++            )
++                await this.#kv.write(ctx, nextRunKey, {
++                    surfaceId: todo.surfaceId,
++                    todoId: todo.id,
++                });
++            const delta =
++                Number(todo.status !== "deleted") -
++                Number(old !== undefined && old.status !== "deleted");
++            if (delta !== 0) {
++                const value = await this.#kv.read(ctx, key);
++                const entry =
++                    value === undefined
++                        ? { surfaceId: todo.surfaceId, count: 0 }
++                        : checked(
++                              Type.Object({
++                                  surfaceId: surfaceIdSchema,
++                                  count: Type.Integer({ minimum: 0 }),
++                              }),
++                              value,
++                          );
++                const count = entry.count + delta;
++                if (count < 0) throw new Error("The execution Surface index is inconsistent.");
++                if (count === 0) await this.#store.deleteValue(ctx, key);
++                else await this.#kv.write(ctx, key, { surfaceId: todo.surfaceId, count });
++            }
++        }
+         const revision = checked(todoRevisionSchema, {
+             todo,
+             actor,
+diff --git a/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts b/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts
+index 960fb06..dd91ef5 100644
+--- a/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts
++++ b/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts
+@@ -8,6 +8,8 @@ import {
+ import { Type } from "@sinclair/typebox";
+ import {
+     surfaceIdSchema,
++    createTodoExecutionSchema,
++    updateTodoExecutionSchema,
+     surfaceSchema,
+     surfaceMemberSchema,
+     todoSchema,
+@@ -120,8 +122,11 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+             capabilities: ["Find shared Surfaces and their members."],
+             searchKeywords: ["list surfaces", "shared todo lists", "sidebar members"],
+             description:
+-                "List shared Surface instances, their IDs, names, types, and joined people. Artifact, bot, and task Surfaces include their target's live name and ID while it is available, or an unavailable state without them. Document Surfaces include promptDocument: null, or the description admins gave it as one of the installation's important documents. Each todo, document, calendar, or System Monitor tool requires a Surface ID. Results are paged.",
+-            parameters: Type.Object(page, { additionalProperties: false }),
++                "List shared Surface instances, their IDs, names, types, and joined people. Optional coordinatorAgentId selects only todo Surfaces with nondeleted execution items managed by that exact agent. Artifact, bot, and task Surfaces include their target's live name and ID while it is available, or an unavailable state without them. Document Surfaces include promptDocument: null, or the description admins gave it as one of the installation's important documents. Each todo, document, calendar, or System Monitor tool requires a Surface ID. Results are paged.",
++            parameters: Type.Object(
++                { ...page, coordinatorAgentId: Type.Optional(surfaceIdSchema) },
++                { additionalProperties: false },
++            ),
+             returnType: Type.Object({
+                 surfaces: Type.Array(surfaceSchema),
+                 nextOffset: Type.Union([Type.Integer(), Type.Null()]),
+@@ -129,7 +134,7 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+             durable: false,
+             shouldReviewInAutoMode: () => false,
+             execute: async (ctx, input) => {
+-                const all = await surfaces.list(ctx);
++                const all = await surfaces.list(ctx, input.coordinatorAgentId);
+                 const start = input.offset ?? 0;
+                 const end = start + (input.limit ?? 20);
+                 return {
+@@ -235,12 +240,13 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+             capabilities: ["Add a todo to a shared Surface."],
+             searchKeywords: ["create todo", "add checklist item", "new reminder"],
+             description:
+-                "Add a plain-text todo at the top of one shared Surface. For a section heading, start the text with exact '# ' (hash and space); it remains an ordinary ordered todo without a checkbox. Explicitly supply authorUserId as a local Happy user ID, or null for no attribution; only null is allowed in standalone mode. The author is immutable and separate from the revision's audit actor. This never creates a chat or joins anyone to the Surface.",
++                "Add a plain-text todo at the top of one shared Surface. Optional execution creates a durable plan item: coordinatorAgentId must be your executing agent ID, with optional project and same-coordinator dependency IDs. It starts pending with a server-created attempt. For a section heading, start the text with exact '# ' (hash and space); it remains an ordinary ordered todo without a checkbox. Explicitly supply authorUserId as a local Happy user ID, or null for no attribution; only null is allowed in standalone mode. The author is immutable and separate from the revision's audit actor. This never creates a chat or joins anyone to the Surface.",
+             parameters: Type.Object(
+                 {
+                     surfaceId: surfaceIdSchema,
+                     text: todoTextSchema,
+                     authorUserId: surfaceMemberSchema.properties.userId,
++                    execution: Type.Optional(createTodoExecutionSchema),
+                 },
+                 { additionalProperties: false },
+             ),
+@@ -255,7 +261,11 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+                 surfaces.createTodo(
+                     ctx,
+                     input.surfaceId,
+-                    { text: input.text, id: await call.kv.getOrCreate(ctx, "todoId", createId) },
++                    {
++                        text: input.text,
++                        id: await call.kv.getOrCreate(ctx, "todoId", createId),
++                        ...(input.execution === undefined ? {} : { execution: input.execution }),
++                    },
+                     await actor(ctx),
+                     input.authorUserId,
+                 ),
+@@ -267,12 +277,13 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+             capabilities: ["Change a todo's text or active, completed, or deleted state."],
+             searchKeywords: ["edit todo", "complete todo", "uncomplete todo", "change todo state"],
+             description:
+-                "Edit text or status (active, completed, deleted) with the current version. Returning an inactive todo to active appends it to the list. To apply a historical state, read its revision and supply the desired fields here; use reorder_todo for placement. Conflicts require a fresh read.",
++                "Edit text or status (active, completed, deleted) with the current version. Execution items instead use execution.phase; only their coordinator accepts completed with existing message or artifact evidence after dependencies are verified. The assigned child may report its own progress, run and evidence, but cannot verify itself. in_progress requires its real run ID. Terminal attempts change only through execution:{retry:true}, which has a stable server mutation identity. Execution history and source files are preserved. Returning an ordinary inactive todo to active appends it to the list. To apply a historical plain todo state, read its revision and supply fields here; use reorder_todo for placement. Conflicts require a fresh read.",
+             parameters: Type.Object(
+                 {
+                     ...guard,
+                     text: Type.Optional(todoTextSchema),
+                     status: Type.Optional(todoStatusSchema),
++                    execution: Type.Optional(updateTodoExecutionSchema),
+                 },
+                 { additionalProperties: false },
+             ),
+@@ -283,16 +294,22 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+             shouldReviewInAutoMode: () => true,
+             describeAutoPermissionAction: ({ surfaceId, todoId }) =>
+                 `editing todo ${JSON.stringify(todoId)} in shared Surface ${JSON.stringify(surfaceId)}. Access: shared data write`,
+-            execute: async (ctx, { surfaceId, todoId, version, ...edit }) =>
+-                surfaces.mutateTodo(
++            execute: async (ctx, { surfaceId, todoId, version, ...edit }, call) => {
++                const mutationId =
++                    edit.execution !== undefined && "retry" in edit.execution
++                        ? await call.kv.getOrCreate(ctx, "retryMutationId", createId)
++                        : undefined;
++                return surfaces.mutateTodo(
+                     ctx,
+                     surfaceId,
+                     todoId,
+                     version,
+                     "update",
+-                    edit,
++                    { ...edit, ...(mutationId === undefined ? {} : { mutationId }) },
+                     await actor(ctx),
+-                ),
++                    mutationId,
++                );
++            },
+             toLLM: textResult,
+         }),
+         defineAgentTool({
+diff --git a/packages/happy-agent-modules/sources/terminals/LEARNINGS.md b/packages/happy-agent-modules/sources/terminals/LEARNINGS.md
+index 9ceabc0..9094aa3 100644
+--- a/packages/happy-agent-modules/sources/terminals/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/terminals/LEARNINGS.md
+@@ -1,5 +1,12 @@
+ # Terminals — learnings
+ 
++## Windows PowerShell uses its own command flags
++
++Named Windows shells previously received POSIX `-lc`, so PowerShell exited before executing the
++command. `powershell` and `pwsh` now receive `-NoLogo -NoProfile -NonInteractive -Command` with
++the unchanged command string. Interactive shells still have no injected flags; cmd keeps its
++native `/d /s /c` launch and POSIX shell handling stays unchanged.
++
+ ## Closing a terminal is instant and violent
+ 
+ `stop` used to send the hangup and then wait for the process to exit, with no bound. A shell that
+diff --git a/packages/happy-agent-modules/sources/terminals/impl/createMachineTerminalProcessFactory.ts b/packages/happy-agent-modules/sources/terminals/impl/createMachineTerminalProcessFactory.ts
+index d48dd91..1edbe64 100644
+--- a/packages/happy-agent-modules/sources/terminals/impl/createMachineTerminalProcessFactory.ts
++++ b/packages/happy-agent-modules/sources/terminals/impl/createMachineTerminalProcessFactory.ts
+@@ -82,6 +82,16 @@ function shellLaunch(
+         const program = shell ?? "cmd.exe";
+         if (command === undefined) return { command: program, args: [] };
+         const name = program.toLowerCase().split(/[\\/]/u).at(-1);
++        if (
++            name === "powershell" ||
++            name === "powershell.exe" ||
++            name === "pwsh" ||
++            name === "pwsh.exe"
++        )
++            return {
++                command: program,
++                args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
++            };
+         return {
+             command: program,
+             args:
+diff --git a/packages/happy-agent-modules/tests/bots/BotsModule.test.ts b/packages/happy-agent-modules/tests/bots/BotsModule.test.ts
+index 4e8316a..61891da 100644
+--- a/packages/happy-agent-modules/tests/bots/BotsModule.test.ts
++++ b/packages/happy-agent-modules/tests/bots/BotsModule.test.ts
+@@ -322,6 +322,61 @@ describe("BotsModule", () => {
+         }
+     });
+ 
++    it("keeps compact coordination guidance on the live system bot without changing other bots", async () => {
++        const fixture = await started("bots-chief-compact-coordination", true);
++        try {
++            await fixture.start();
++            const [chief] = await fixture.bots.list(fixture.database.context);
++            if (chief === undefined) throw new Error("The Chief of Staff bot was not seeded.");
++            const ordinary = await fixture.bots.create(fixture.database.context, {
++                id: "ordinarycoordinator",
++                name: "Research Assistant",
++                username: "research_assistant",
++            });
++            const ordinaryBefore = await fixture.instructions(ordinary.agentId);
++            const renamed = await fixture.bots.rename(
++                fixture.database.context,
++                chief.id,
++                "Siber",
++                chief.version,
++            );
++            const instructions = await fixture.instructions(chief.agentId);
++            expect(instructions).toContain('persistent bot named "Siber"');
++            expect(renamed).toMatchObject({
++                id: chief.id,
++                username: chief.username,
++                agentId: chief.agentId,
++                systemKey: "chief_of_staff",
++            });
++            expect(instructions).toContain("prepare a compact working brief");
++            expect(instructions).toContain("a brief is not new authority");
++            expect(instructions).toContain(`Executing coordinator agent ID: \`${chief.agentId}\``);
++            expect(instructions).toContain("Discover list_surfaces with coordinatorAgentId");
++            expect(instructions).toContain("create_todo with execution.coordinatorAgentId");
++            expect(instructions).toContain("bind its real runId");
++            expect(instructions).toContain("existing agent-message or artifact evidence");
++            expect(instructions).toContain("HTTP retries reuse their mutationId");
++            expect(instructions).toContain("Do not copy the entire conversation");
++            expect(instructions).toContain("current agent_options");
++            expect(instructions).toContain("Do not repeatedly ask an active child for status");
++            expect(instructions).toContain("Where automatic reporting is not provided");
++            expect(instructions).toContain("Do not silently truncate evidence");
++            expect(instructions).toContain("latest user corrections, scope, permissions");
++            expect(instructions).toContain("a child saying done is not proof");
++            expect(instructions).toContain("use create_task");
++            expect(instructions).toContain("Use create_subtask");
++            expect(instructions).toContain("Use create_agent for internal research");
++            await expect(fixture.instructions(ordinary.agentId)).resolves.toBe(ordinaryBefore);
++            expect(ordinaryBefore).not.toContain("prepare a compact working brief");
++            expect(ordinaryBefore).not.toContain("Executing coordinator agent ID");
++            await expect(fixture.instructions("someoneelsesagent")).resolves.toBe(
++                BOT_REFERENCE_INSTRUCTIONS,
++            );
++        } finally {
++            await fixture.close();
++        }
++    });
++
+     it("keeps the name an earlier release gave the built-in bot", async () => {
+         const fixture = await started("bots-chief-of-staff-name-kept", true);
+         try {
+diff --git a/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts b/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
+index 27d711d..31f8d3d 100644
+--- a/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
++++ b/packages/happy-agent-modules/tests/collaboration/CollaborationModule.test.ts
+@@ -24,6 +24,7 @@ import { createRootContext, type Context } from "@steve.kite/stdlib";
+ import { mkdtemp, writeFile } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
++import { execFileSync } from "node:child_process";
+ 
+ import { describe, expect, it, vi } from "vitest";
+ 
+@@ -1929,7 +1930,19 @@ const HARNESSES_TOML = [
+  */
+ async function harnessConfig(extra = "") {
+     const bin = await mkdtemp(join(tmpdir(), "fake-agy-"));
+-    const agy = join(bin, "agy");
++    const agy = join(bin, process.platform === "win32" ? "agy.exe" : "agy");
++    if (process.platform === "win32") {
++        const source = join(bin, "Program.cs");
++        const output = [
++            "Gemini Models\tWeekly Limit Remaining\t95%\t2026-10-27T00:00:00Z",
++            "Gemini Models\tFive Hour Limit Remaining\t99%\t2026-10-21T01:34:03Z",
++            "Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t0%\t2026-10-26T21:29:49Z",
++            "",
++        ].join("\n");
++        await writeFile(source, `public static class Program { public static void Main() { System.Console.Write(${JSON.stringify(output)}); } }`);
++        execFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"), ["/nologo", "/target:exe", `/out:${agy}`, source], { windowsHide: true, timeout: 15_000 });
++        return await temporaryTestConfig(`${HARNESSES_TOML}\nenv = { AGY_BIN = ${JSON.stringify(agy)} }\n${extra}`);
++    }
+     await writeFile(
+         agy,
+         [
+@@ -1941,7 +1954,7 @@ async function harnessConfig(extra = "") {
+         ].join("\n"),
+         { mode: 0o755 },
+     );
+-    return await temporaryTestConfig(`${HARNESSES_TOML}\nenv = { AGY_BIN = "${agy}" }\n${extra}`);
++    return await temporaryTestConfig(`${HARNESSES_TOML}\nenv = { AGY_BIN = ${JSON.stringify(agy)} }\n${extra}`);
+ }
+ 
+ const ON_HAPPY = { provider: "claude", model: "opus-5" } as const;
+diff --git a/packages/happy-agent-modules/tests/history/HistoryRuns.test.ts b/packages/happy-agent-modules/tests/history/HistoryRuns.test.ts
+index 597b44b..3560124 100644
+--- a/packages/happy-agent-modules/tests/history/HistoryRuns.test.ts
++++ b/packages/happy-agent-modules/tests/history/HistoryRuns.test.ts
+@@ -156,6 +156,53 @@ async function finishInference(
+ }
+ 
+ describe("HistoryModule run history", () => {
++    it.each(["completed", "aborted", "failed"] as const)(
++        "reads newest metadata without messages and preserves %s outcomes",
++        async (status) => {
++            const world = await setup(`history-latest-${status}`);
++            try {
++                const ctx = world.database.context;
++                expect(await world.history.latestRun(ctx, "agent-a")).toBeUndefined();
++                await world.history.beginMaintenanceRun(ctx, "agent-a", "old-run", 200);
++                await world.history.finishMaintenanceRun(
++                    ctx,
++                    "agent-a",
++                    "old-run",
++                    "completed",
++                    220,
++                );
++                // Sequence, not wall-clock order, decides the newest run.
++                await world.history.beginMaintenanceRun(ctx, "agent-a", "new-run", 100);
++                expect(await world.history.latestRun(ctx, "agent-a")).toEqual({
++                    id: "new-run",
++                    agentId: "agent-a",
++                    status: "running",
++                    reason: null,
++                    startedAt: 100,
++                    endedAt: null,
++                });
++                await world.history.finishMaintenanceRun(ctx, "agent-a", "new-run", status, 150);
++                expect(await world.history.latestRun(ctx, "agent-a")).toEqual({
++                    id: "new-run",
++                    agentId: "agent-a",
++                    status,
++                    reason:
++                        status === "completed"
++                            ? "completed"
++                            : status === "failed"
++                              ? "error"
++                              : "abort",
++                    startedAt: 100,
++                    endedAt: 150,
++                });
++                expect(await world.history.latestRun(ctx, "other-agent")).toBeUndefined();
++                expect((await world.history.runs(ctx, "agent-a")).runs).toEqual([]);
++            } finally {
++                world.database.close();
++            }
++        },
++    );
++
+     it("reuses compiled nested validators across repeated history pages", async () => {
+         const world = await setup("history-runs-compiled-validation");
+         try {
+diff --git a/packages/happy-agent-modules/tests/runtime/subagentExecutionApi.test.ts b/packages/happy-agent-modules/tests/runtime/subagentExecutionApi.test.ts
+new file mode 100644
+index 0000000..ed2d5e0
+--- /dev/null
++++ b/packages/happy-agent-modules/tests/runtime/subagentExecutionApi.test.ts
+@@ -0,0 +1,157 @@
++import { mkdir, mkdtemp, rm } from "node:fs/promises";
++import { createServer, type Server } from "node:http";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { createId } from "@paralleldrive/cuid2";
++import { AgentProviders, withAgentDatabase } from "@slopus/happy-agent-base";
++import { HappyAgentClient } from "@slopus/happy-agent-client";
++import { expect, it } from "vitest";
++import {
++    startHappyAgentRuntime,
++    type HappyAgentRuntime,
++} from "../../sources/runtime/startHappyAgentRuntime.js";
++import { ScriptedProvider } from "../support/ScriptedProvider.js";
++
++// Lifecycle fixtures use public owning-module methods; HTTP and persistence are real.
++// No provider inference or transcript is needed to prove metadata-only projection.
++it("serves child execution metadata in activity and focused bootstrap, scoped and durable", async () => {
++    const home = await mkdtemp(join(tmpdir(), "sx-"));
++    const workspace = join(home, "workspace");
++    await mkdir(workspace);
++    let runtime: HappyAgentRuntime | undefined;
++    let server: Server | undefined;
++    let endpoint = "";
++    const stop = async () => {
++        server?.closeAllConnections();
++        if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
++        server = undefined;
++        await runtime?.close();
++        runtime = undefined;
++    };
++    const start = async () => {
++        const providers = new AgentProviders();
++        providers.add("gym", new ScriptedProvider([]), "codex");
++        runtime = await startHappyAgentRuntime({
++            happyHome: join(home, ".happy"),
++            environment: { ...process.env, HOME: home },
++            inference: {
++                providers,
++                models: [
++                    {
++                        id: "gym/model",
++                        providerId: "gym",
++                        name: "Gym",
++                        defaultEffort: "medium",
++                        effortLevels: ["medium"],
++                    },
++                ],
++            },
++            onPrepared: async (prepared) => {
++                server = createServer((request, response) => {
++                    void prepared.api.handleRequest(
++                        prepared.context("execution-summary.http"),
++                        request,
++                        response,
++                    );
++                });
++                await new Promise<void>((resolve, reject) => {
++                    server!.once("error", reject);
++                    server!.listen(0, "127.0.0.1", resolve);
++                });
++                const address = server.address();
++                if (!address || typeof address === "string")
++                    throw new Error("Missing HTTP fixture.");
++                endpoint = `http://127.0.0.1:${address.port}`;
++            },
++        });
++        return new HappyAgentClient({ endpoint, token: runtime.api.token()! });
++    };
++    try {
++        let client = await start();
++        const { project } = await client.registerProject({ path: workspace });
++        const { agent: parent } = await client.createAgent({
++            workspaceId: project.id,
++            title: "Coordinator",
++        });
++        const { agent: other } = await client.createAgent({
++            workspaceId: project.id,
++            title: "Other",
++        });
++        const ctx = withAgentDatabase(
++            runtime!.ctx.named("execution-summary.fixtures"),
++            runtime!.database,
++        );
++        const child = await runtime!.system.create(
++            ctx,
++            {
++                metadata: {
++                    title: "Helper",
++                    lastMode: {
++                        providerId: "gym",
++                        modelId: "gym/model",
++                        effort: "medium",
++                        serviceTier: null,
++                        permissionMode: "auto",
++                    },
++                },
++            },
++            { parent: parent.id },
++        );
++        const empty = await runtime!.system.create(
++            ctx,
++            { metadata: { title: "Not started" } },
++            { parent: parent.id },
++        );
++        expect((await client.getAgentActivity(parent.id)).subagentExecution?.[empty.id]).toEqual({
++            modelId: null,
++            latestRun: null,
++        });
++        for (const status of ["completed", "aborted", "failed"] as const) {
++            const runId = createId();
++            await runtime!.modules.history.beginMaintenanceRun(ctx, child.id, runId, 100);
++            const running = (await client.getAgentActivity(parent.id)).subagentExecution?.[
++                child.id
++            ];
++            expect(running).toEqual({
++                modelId: "gym/model",
++                latestRun: {
++                    id: runId,
++                    status: "running",
++                    reason: null,
++                    startedAt: 100,
++                    endedAt: null,
++                },
++            });
++            await runtime!.modules.history.finishMaintenanceRun(ctx, child.id, runId, status, 200);
++            const activity = await client.getAgentActivity(parent.id);
++            const summary = activity.subagentExecution?.[child.id];
++            expect(summary?.latestRun).toEqual({
++                id: runId,
++                status,
++                reason:
++                    status === "completed" ? "completed" : status === "aborted" ? "abort" : "error",
++                startedAt: 100,
++                endedAt: 200,
++            });
++            expect((await client.getAgentBootstrap(parent.id)).subagentExecution).toEqual(
++                activity.subagentExecution,
++            );
++            expect(Object.keys(activity.subagentExecution ?? {}).sort()).toEqual(
++                activity.subagents.map((agent) => agent.id).sort(),
++            );
++            expect(JSON.stringify(summary)).not.toMatch(/messages|usage|costUsd|queuedCount/);
++        }
++        expect((await client.getAgentActivity(other.id)).subagentExecution).toEqual({});
++        const unauthorized = new HappyAgentClient({ endpoint, token: "wrong-token" });
++        await expect(unauthorized.getAgentActivity(parent.id)).rejects.toMatchObject({
++            status: 401,
++        });
++        const finalSummary = (await client.getAgentActivity(parent.id)).subagentExecution;
++        await stop();
++        client = await start();
++        expect((await client.getAgentActivity(parent.id)).subagentExecution).toEqual(finalSummary);
++    } finally {
++        await stop();
++        await rm(home, { force: true, recursive: true, maxRetries: 10, retryDelay: 100 });
++    }
++}, 60_000);
+diff --git a/packages/happy-agent-modules/tests/runtime/surfaceExecutionApi.test.ts b/packages/happy-agent-modules/tests/runtime/surfaceExecutionApi.test.ts
+new file mode 100644
+index 0000000..81639af
+--- /dev/null
++++ b/packages/happy-agent-modules/tests/runtime/surfaceExecutionApi.test.ts
+@@ -0,0 +1,185 @@
++import { mkdir, mkdtemp, rm } from "node:fs/promises";
++import { createServer, type Server } from "node:http";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { createId } from "@paralleldrive/cuid2";
++import { AgentProviders } from "@slopus/happy-agent-base";
++import { HappyAgentClient } from "@slopus/happy-agent-client";
++import { expect, it } from "vitest";
++import {
++    startHappyAgentRuntime,
++    type HappyAgentRuntime,
++} from "../../sources/runtime/startHappyAgentRuntime.js";
++import { ScriptedProvider } from "../support/ScriptedProvider.js";
++
++it("serves coordinator plans over authenticated HTTP and persists stale retry receipts through a daemon restart", async () => {
++    const home = await mkdtemp(join(tmpdir(), "se-"));
++    const workspace = join(home, "workspace");
++    await mkdir(workspace);
++    let runtime: HappyAgentRuntime | undefined;
++    let server: Server | undefined;
++    let endpoint = "";
++    const stop = async () => {
++        server?.closeAllConnections();
++        if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
++        server = undefined;
++        await runtime?.close();
++        runtime = undefined;
++    };
++    const start = async () => {
++        const providers = new AgentProviders();
++        providers.add("gym", new ScriptedProvider([]), "codex");
++        runtime = await startHappyAgentRuntime({
++            happyHome: join(home, ".happy"),
++            environment: { ...process.env, HOME: home },
++            inference: {
++                providers,
++                models: [
++                    {
++                        id: "gym/model",
++                        providerId: "gym",
++                        name: "Gym",
++                        defaultEffort: "medium",
++                        effortLevels: ["medium"],
++                    },
++                ],
++            },
++            onPrepared: async (prepared) => {
++                server = createServer((request, response) => {
++                    void prepared.api.handleRequest(
++                        prepared.context("execution-test.http"),
++                        request,
++                        response,
++                    );
++                });
++                await new Promise<void>((resolve, reject) => {
++                    server!.once("error", reject);
++                    server!.listen(0, "127.0.0.1", resolve);
++                });
++                const address = server.address();
++                if (!address || typeof address === "string")
++                    throw new Error("Missing fixture address.");
++                endpoint = `http://127.0.0.1:${address.port}`;
++            },
++        });
++        return new HappyAgentClient({ endpoint, token: runtime.api.token()! });
++    };
++    try {
++        let client = await start();
++        const { project } = await client.registerProject({ path: workspace });
++        const { agent: coordinator } = await client.createAgent({
++            workspaceId: project.id,
++            title: "Coordinator",
++        });
++        const { agent: other } = await client.createAgent({
++            workspaceId: project.id,
++            title: "Other",
++        });
++        const { surface } = await client.createSurface({ type: "todo", name: "Plan" });
++        expect(
++            (await client.listSurfaces({ coordinatorAgentId: coordinator.id })).surfaces,
++        ).toEqual([]);
++        const todo = (
++            await client.createTodo(surface.id, {
++                text: "Verify plan",
++                execution: {
++                    coordinatorAgentId: coordinator.id,
++                    projectId: project.id,
++                },
++            })
++        ).todo;
++        expect(todo.execution).toMatchObject({ phase: "pending", dependsOn: [], evidence: [] });
++        expect(
++            (await client.listSurfaces({ coordinatorAgentId: coordinator.id })).surfaces.map(
++                (entry) => entry.id,
++            ),
++        ).toEqual([surface.id]);
++        expect((await client.listSurfaces({ coordinatorAgentId: other.id })).surfaces).toEqual([]);
++        await expect(client.listSurfaces({ coordinatorAgentId: "bad" })).rejects.toMatchObject({
++            status: 400,
++            code: "invalid_request",
++        });
++        await expect(client.listSurfaces({ coordinatorAgentId: createId() })).rejects.toMatchObject(
++            { status: 404, code: "not_found" },
++        );
++        const unauthenticated = new HappyAgentClient({ endpoint, token: "wrong-token" });
++        await expect(
++            unauthenticated.updateTodo(
++                surface.id,
++                todo.id,
++                { execution: { phase: "failed" } },
++                { ifMatch: todo.version },
++            ),
++        ).rejects.toMatchObject({ status: 401 });
++        await expect(
++            client.updateTodo(
++                surface.id,
++                todo.id,
++                {
++                    execution: {
++                        phase: "completed",
++                        verification: { userId: null, agentId: null, acceptedAt: 1 },
++                    },
++                } as never,
++                { ifMatch: todo.version },
++            ),
++        ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
++        await expect(
++            client.updateTodo(
++                surface.id,
++                todo.id,
++                { status: "completed" },
++                { ifMatch: todo.version },
++            ),
++        ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
++        expect((await client.getTodo(surface.id, todo.id)).todo).toEqual(todo);
++        const failed = (
++            await client.updateTodo(
++                surface.id,
++                todo.id,
++                { execution: { phase: "failed" } },
++                { ifMatch: todo.version },
++            )
++        ).todo;
++        const mutationId = "http-retry-1";
++        const request = { execution: { retry: true as const }, mutationId };
++        const retry = (
++            await client.updateTodo(surface.id, todo.id, request, { ifMatch: failed.version })
++        ).todo;
++        expect(retry.execution?.attempt.id).not.toBe(failed.execution?.attempt.id);
++        expect(
++            (await client.updateTodo(surface.id, todo.id, request, { ifMatch: failed.version }))
++                .todo,
++        ).toEqual(retry);
++        await expect(
++            client.updateTodo(
++                surface.id,
++                todo.id,
++                { text: "different", mutationId },
++                { ifMatch: retry.version },
++            ),
++        ).rejects.toMatchObject({ status: 409, code: "conflict" });
++        const versions = await client.listTodoVersions(surface.id, todo.id);
++        expect(versions.versions).toHaveLength(3);
++        await stop();
++        client = await start();
++        expect(
++            (await client.listSurfaces({ coordinatorAgentId: coordinator.id })).surfaces,
++        ).toHaveLength(1);
++        expect(
++            (await client.updateTodo(surface.id, todo.id, request, { ifMatch: failed.version }))
++                .todo,
++        ).toEqual(retry);
++        expect(await client.listTodoVersions(surface.id, todo.id)).toEqual(versions);
++        const deleted = (await client.deleteTodo(surface.id, todo.id, { ifMatch: retry.version }))
++            .todo;
++        expect(deleted.execution).toEqual(retry.execution);
++        expect(
++            (await client.listSurfaces({ coordinatorAgentId: coordinator.id })).surfaces,
++        ).toEqual([]);
++        expect((await client.listTodoVersions(surface.id, todo.id)).versions).toHaveLength(4);
++    } finally {
++        await stop();
++        await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
++    }
++}, 60_000);
+diff --git a/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts b/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts
+new file mode 100644
+index 0000000..fedd2c4
+--- /dev/null
++++ b/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts
+@@ -0,0 +1,478 @@
++import { createId } from "@paralleldrive/cuid2";
++import {
++    ensureAgentDatabaseConnection,
++    type AgentSystemRef,
++    type AgentModuleScope,
++    type AgentBaseSettlement,
++} from "@slopus/happy-agent-base";
++import type { Todo, UpdateTodoRequest } from "@slopus/happy-agent-client";
++import { afterEach, expect, it, vi } from "vitest";
++import { DurableFunctionsModule } from "../../sources/durableFunctions/index.js";
++import { SurfacesModule } from "../../sources/surfaces/index.js";
++import { SurfacesPersistence } from "../../sources/surfaces/persistence/SurfacesPersistence.js";
++import type { HistoryModule, HistoryRunState } from "../../sources/history/index.js";
++import type { TeamModule } from "../../sources/team/index.js";
++import type { BotsModule } from "../../sources/bots/index.js";
++import type { TasksModule } from "../../sources/tasks/index.js";
++import type { ArtifactsModule } from "../../sources/artifacts/index.js";
++import type { ComputeModule } from "../../sources/compute/index.js";
++import type { ConfigModule } from "../../sources/config/index.js";
++import type { RunnersModule } from "../../sources/runners/index.js";
++import type { ProjectsModule } from "../../sources/projects/index.js";
++import type { WorkspacesModule } from "../../sources/workspaces/index.js";
++import { moduleDatabase } from "../support/moduleDatabase.js";
++
++const disposers: (() => void)[] = [];
++afterEach(() =>
++    disposers
++        .splice(0)
++        .reverse()
++        .forEach((dispose) => dispose()),
++);
++
++async function fixture() {
++    const coordinator = createId(),
++        child = createId(),
++        outsider = createId(),
++        project = createId();
++    const parents = new Map<string, string | null>([
++        [coordinator, null],
++        [child, coordinator],
++        [outsider, null],
++    ]);
++    const runs = new Map<string, HistoryRunState>();
++    const messages = new Set<string>();
++    const artifacts = new Set<string>();
++    const archived = new Set<string>();
++    const durable = new DurableFunctionsModule();
++    const history = {
++        run: async (_ctx: unknown, agentId: string, runId: string) => {
++            const run = runs.get(runId);
++            return run?.agentId === agentId ? run : undefined;
++        },
++        message: async (_ctx: unknown, agentId: string, messageId: string) =>
++            messages.has(agentId + ":" + messageId) ? { recordId: messageId } : undefined,
++    } as unknown as HistoryModule;
++    const surfaces = new SurfacesModule(
++        durable,
++        { enabled: false } as TeamModule,
++        {} as BotsModule,
++        {} as TasksModule,
++        {
++            get: async (_ctx: unknown, id: string) =>
++                artifacts.has(id) ? { id, status: "active" } : undefined,
++        } as unknown as ArtifactsModule,
++        {} as ComputeModule,
++        { configuration: { values: { features: { workspaces: true } } } } as ConfigModule,
++        {} as RunnersModule,
++        history,
++        {
++            get: async (_ctx: unknown, id: string) =>
++                id === project ? { id, status: "active" } : undefined,
++            projectForAgent: async (_ctx: unknown, id: string) =>
++                id === coordinator ? { id: project } : undefined,
++        } as unknown as ProjectsModule,
++        { workspaceForAgent: async () => undefined } as unknown as WorkspacesModule,
++    );
++    const db = moduleDatabase(
++        [...durable.migrations, ...surfaces.migrations],
++        "todo-execution-test",
++    );
++    ensureAgentDatabaseConnection(db.database);
++    disposers.push(() => {
++        durable.stop();
++        db.close();
++    });
++    await db.ready;
++    const agents = {
++        config: async (_ctx: unknown, id: string) =>
++            parents.has(id) ? { metadata: archived.has(id) ? { archivedAt: 200 } : {} } : undefined,
++        parentOf: async (_ctx: unknown, id: string) => parents.get(id) ?? null,
++    } as unknown as AgentSystemRef;
++    const hooks = surfaces.beforeStart(db.context, agents);
++    const list = await surfaces.create(db.context, { type: "todo", name: "Plan" }, null);
++    const actor = { agentId: coordinator, userId: null };
++    const create = (dependsOn: string[] = []) =>
++        surfaces.createTodo(
++            db.context,
++            list.id,
++            {
++                text: "Implement",
++                execution: { coordinatorAgentId: coordinator, projectId: project, dependsOn },
++            },
++            actor,
++            null,
++        );
++    const update = (todo: Todo, edit: UpdateTodoRequest, agentId: string | null = coordinator) =>
++        surfaces.mutateTodo(
++            db.context,
++            list.id,
++            todo.id,
++            todo.version,
++            "update",
++            edit,
++            { userId: null, agentId },
++            edit.mutationId,
++        );
++    return {
++        surfaces,
++        db,
++        list,
++        coordinator,
++        child,
++        outsider,
++        project,
++        actor,
++        create,
++        update,
++        runs,
++        messages,
++        artifacts,
++        archived,
++        agents,
++        hooks,
++        durable,
++        kv: new SurfacesPersistence(db.database).kv(),
++    };
++}
++
++it("preserves plain todos and records execution phases, evidence and authoritative run times", async () => {
++    const f = await fixture();
++    const plain = await f.surfaces.createTodo(
++        f.db.context,
++        f.list.id,
++        { text: "plain" },
++        f.actor,
++        null,
++    );
++    expect(plain.execution).toBeUndefined();
++    expect((await f.update(plain, { status: "completed" })).status).toBe("completed");
++    const pending = await f.create();
++    expect(
++        (await f.surfaces.list(f.db.context, f.coordinator)).map((surface) => surface.id),
++    ).toEqual([f.list.id]);
++    expect(await f.surfaces.list(f.db.context, f.outsider)).toEqual([]);
++    expect(pending.execution).toMatchObject({ phase: "pending", dependsOn: [], evidence: [] });
++    const runId = createId();
++    f.runs.set(runId, {
++        id: runId,
++        agentId: f.child,
++        status: "running",
++        reason: null,
++        startedAt: 100,
++        endedAt: null,
++    });
++    const assigned = await f.update(pending, { execution: { assigneeAgentId: f.child } });
++    const running = await f.update(
++        assigned,
++        { execution: { phase: "in_progress", runId } },
++        f.child,
++    );
++    expect(running.execution?.attempt).toMatchObject({ runId, startedAt: 100 });
++    await expect(f.update(running, { status: "completed" })).rejects.toMatchObject({
++        code: "invalid_request",
++    });
++    await expect(
++        f.update(running, { execution: { phase: "completed" } }, f.child),
++    ).rejects.toMatchObject({ code: "forbidden" });
++    await expect(f.update(running, { execution: { phase: "completed" } })).rejects.toMatchObject({
++        code: "invalid_request",
++    });
++    await expect(
++        f.update(running, { execution: { assigneeAgentId: f.coordinator } }),
++    ).rejects.toMatchObject({ code: "invalid_request" });
++    await expect(f.update(running, { execution: { runId: createId() } })).rejects.toMatchObject({
++        code: "invalid_request",
++    });
++    const messageId = createId();
++    f.messages.add(f.child + ":" + messageId);
++    f.runs.set(runId, {
++        id: runId,
++        agentId: f.child,
++        status: "completed",
++        reason: "completed",
++        startedAt: 100,
++        endedAt: 180,
++    });
++    f.archived.add(f.child);
++    const completed = await f.update(running, {
++        execution: {
++            phase: "completed",
++            evidence: [{ kind: "agent_message", agentId: f.child, messageId }],
++        },
++    });
++    expect(completed).toMatchObject({
++        status: "completed",
++        execution: {
++            phase: "completed",
++            attempt: { runId, startedAt: 100, finishedAt: 180 },
++            verification: { agentId: f.coordinator, userId: null },
++        },
++    });
++    const versions = await f.surfaces.versions(f.db.context, f.list.id, completed.id);
++    expect(versions.versions).toHaveLength(4);
++    expect(versions.versions[0]?.todo.execution?.phase).toBe("pending");
++});
++
++it("durably stops elapsed time when a bound run settles without inventing task completion", async () => {
++    const f = await fixture();
++    const runId = createId();
++    f.runs.set(runId, {
++        id: runId,
++        agentId: f.child,
++        status: "running",
++        reason: null,
++        startedAt: 100,
++        endedAt: null,
++    });
++    const todo = await f.update(await f.create(), {
++        execution: { assigneeAgentId: f.child, phase: "in_progress", runId },
++    });
++    await f.durable.beforeStart(f.db.context).afterStart?.(f.db.context, f.agents);
++    f.runs.set(runId, {
++        id: runId,
++        agentId: f.child,
++        status: "completed",
++        reason: "completed",
++        startedAt: 100,
++        endedAt: 150,
++    });
++    const scope = { agent: { id: f.child } } as AgentModuleScope;
++    await f.hooks.afterAgentSettledTransact?.(f.db.context, scope, {
++        settlementId: createId(),
++    } as AgentBaseSettlement);
++    await vi.waitFor(async () => {
++        expect(
++            (await f.surfaces.getTodo(f.db.context, f.list.id, todo.id)).execution?.attempt
++                .finishedAt,
++        ).toBe(150);
++    });
++    const settled = await f.surfaces.getTodo(f.db.context, f.list.id, todo.id);
++    expect(settled.status).toBe("active");
++    expect(settled.execution?.phase).toBe("in_progress");
++    expect(settled.execution?.verification).toBeUndefined();
++    const versions = await f.surfaces.versions(f.db.context, f.list.id, todo.id);
++    expect(versions.versions).toHaveLength(3);
++    await f.hooks.afterAgentSettledTransact?.(f.db.context, scope, {
++        settlementId: createId(),
++    } as AgentBaseSettlement);
++    expect((await f.surfaces.versions(f.db.context, f.list.id, todo.id)).versions).toHaveLength(3);
++});
++
++it("rejects foreign actors, invalid identities, cycles and missing evidence atomically", async () => {
++    const f = await fixture();
++    const one = await f.create();
++    const two = await f.create([one.id]);
++    await expect(f.update(one, { execution: { dependsOn: [two.id] } })).rejects.toMatchObject({
++        code: "invalid_request",
++    });
++    await expect(
++        f.update(one, { execution: { phase: "blocked" } }, f.outsider),
++    ).rejects.toMatchObject({ code: "forbidden" });
++    await expect(
++        f.update(one, { execution: { assigneeAgentId: f.outsider } }),
++    ).rejects.toMatchObject({ code: "not_found" });
++    await expect(
++        f.update(one, {
++            execution: {
++                phase: "completed",
++                evidence: [{ kind: "artifact", artifactId: createId() }],
++            },
++        }),
++    ).rejects.toMatchObject({ code: "not_found" });
++    await expect(
++        f.surfaces.createTodo(
++            f.db.context,
++            f.list.id,
++            {
++                text: "wrong manager",
++                execution: { coordinatorAgentId: f.outsider },
++            },
++            f.actor,
++            null,
++        ),
++    ).rejects.toMatchObject({ code: "forbidden" });
++    await expect(
++        f.surfaces.createTodo(
++            f.db.context,
++            f.list.id,
++            {
++                text: "wrong project",
++                execution: { coordinatorAgentId: f.coordinator, projectId: createId() },
++            },
++            f.actor,
++            null,
++        ),
++    ).rejects.toMatchObject({ code: "not_found" });
++    const artifactId = createId();
++    f.artifacts.add(artifactId);
++    await expect(
++        f.update(two, {
++            execution: { phase: "completed", evidence: [{ kind: "artifact", artifactId }] },
++        }),
++    ).rejects.toMatchObject({ code: "invalid_request" });
++    expect(await f.surfaces.getTodo(f.db.context, f.list.id, one.id)).toEqual(one);
++    expect((await f.surfaces.versions(f.db.context, f.list.id, one.id)).versions).toHaveLength(1);
++    const assigned = await f.update(one, { execution: { assigneeAgentId: f.child } });
++    await expect(
++        f.surfaces.mutateTodo(
++            f.db.context,
++            f.list.id,
++            assigned.id,
++            assigned.version,
++            "delete",
++            {},
++            { userId: null, agentId: f.child },
++        ),
++    ).rejects.toMatchObject({ code: "forbidden" });
++    for (const edit of [
++        { text: "tamper" },
++        { execution: { dependsOn: [] } },
++        { execution: { assigneeAgentId: f.child } },
++    ] as UpdateTodoRequest[])
++        await expect(f.update(assigned, edit, f.child)).rejects.toMatchObject({
++            code: "forbidden",
++        });
++});
++
++it("persists one retry receipt across module restart and preserves deletion and prior attempts", async () => {
++    const f = await fixture();
++    const first = await f.create();
++    const failed = await f.update(first, { execution: { phase: "failed" } });
++    const mutationId = "retry-1";
++    const retry = await f.update(failed, { execution: { retry: true }, mutationId });
++    expect(retry.execution?.phase).toBe("pending");
++    expect(retry.execution?.attempt.id).not.toBe(failed.execution?.attempt.id);
++    f.surfaces.beforeStart(f.db.context, f.agents);
++    expect(await f.update(failed, { execution: { retry: true }, mutationId })).toEqual(retry);
++    await expect(f.update(failed, { text: "different", mutationId })).rejects.toMatchObject({
++        code: "conflict",
++    });
++    await expect(
++        f.update(retry, { execution: { retry: true }, mutationId: "retry-2" }),
++    ).rejects.toMatchObject({ code: "invalid_request" });
++    const deleted = await f.surfaces.mutateTodo(
++        f.db.context,
++        f.list.id,
++        retry.id,
++        retry.version,
++        "delete",
++        {},
++        f.actor,
++    );
++    expect(deleted.execution).toEqual(retry.execution);
++    await expect(f.update(deleted, { status: "active" })).rejects.toMatchObject({
++        code: "invalid_request",
++    });
++    expect((await f.surfaces.versions(f.db.context, f.list.id, first.id)).versions).toHaveLength(4);
++    expect(await f.surfaces.list(f.db.context, f.coordinator)).toEqual([]);
++});
++
++it("keeps the coordinator index until the last live todo is deleted and enforces run ownership", async () => {
++    const f = await fixture();
++    const one = await f.create();
++    const two = await f.create();
++    const foreignRun = createId();
++    f.runs.set(foreignRun, {
++        id: foreignRun,
++        agentId: f.outsider,
++        status: "running",
++        reason: null,
++        startedAt: 10,
++        endedAt: null,
++    });
++    await expect(
++        f.update(one, {
++            execution: { assigneeAgentId: f.child, phase: "in_progress", runId: foreignRun },
++        }),
++    ).rejects.toMatchObject({ code: "not_found" });
++    await f.surfaces.mutateTodo(
++        f.db.context,
++        f.list.id,
++        one.id,
++        one.version,
++        "delete",
++        {},
++        f.actor,
++    );
++    expect(await f.surfaces.list(f.db.context, f.coordinator)).toHaveLength(1);
++    await f.surfaces.mutateTodo(
++        f.db.context,
++        f.list.id,
++        two.id,
++        two.version,
++        "delete",
++        {},
++        f.actor,
++    );
++    expect(await f.surfaces.list(f.db.context, f.coordinator)).toHaveLength(0);
++});
++
++it("isolates same-ID run bindings across Surfaces when one item is deleted", async () => {
++    const f = await fixture();
++    const second = await f.surfaces.create(f.db.context, { type: "todo", name: "Second" }, null);
++    const id = createId(),
++        runId = createId();
++    f.runs.set(runId, {
++        id: runId,
++        agentId: f.child,
++        status: "running",
++        reason: null,
++        startedAt: 100,
++        endedAt: null,
++    });
++    const todos: Todo[] = [];
++    for (const surfaceId of [f.list.id, second.id]) {
++        const todo = await f.surfaces.createTodo(
++            f.db.context,
++            surfaceId,
++            {
++                id,
++                text: "same local identity",
++                execution: { coordinatorAgentId: f.coordinator },
++            },
++            f.actor,
++            null,
++        );
++        todos.push(
++            await f.surfaces.mutateTodo(
++                f.db.context,
++                surfaceId,
++                id,
++                todo.version,
++                "update",
++                { execution: { assigneeAgentId: f.child, phase: "in_progress", runId } },
++                f.actor,
++            ),
++        );
++    }
++    await f.surfaces.mutateTodo(
++        f.db.context,
++        f.list.id,
++        id,
++        todos[0]!.version,
++        "delete",
++        {},
++        f.actor,
++    );
++    await f.durable.beforeStart(f.db.context).afterStart?.(f.db.context, f.agents);
++    f.runs.set(runId, {
++        id: runId,
++        agentId: f.child,
++        status: "completed",
++        reason: "completed",
++        startedAt: 100,
++        endedAt: 200,
++    });
++    await f.hooks.afterAgentSettledTransact?.(
++        f.db.context,
++        { agent: { id: f.child } } as AgentModuleScope,
++        { settlementId: createId() } as AgentBaseSettlement,
++    );
++    await vi.waitFor(async () =>
++        expect(
++            (await f.surfaces.getTodo(f.db.context, second.id, id)).execution?.attempt.finishedAt,
++        ).toBe(200),
++    );
++    expect((await f.surfaces.getTodo(f.db.context, f.list.id, id)).status).toBe("deleted");
++});
+diff --git a/packages/happy-agent-modules/tests/terminals/createMachineTerminalProcessFactory.test.ts b/packages/happy-agent-modules/tests/terminals/createMachineTerminalProcessFactory.test.ts
+index 6f1871a..a51718d 100644
+--- a/packages/happy-agent-modules/tests/terminals/createMachineTerminalProcessFactory.test.ts
++++ b/packages/happy-agent-modules/tests/terminals/createMachineTerminalProcessFactory.test.ts
+@@ -10,6 +10,32 @@ import { describe, expect, it } from "vitest";
+ import { createMachineTerminalProcessFactory } from "../../sources/terminals/impl/createMachineTerminalProcessFactory.js";
+ 
+ describe("createMachineTerminalProcessFactory", () => {
++    it.each(["powershell", "PowerShell.EXE", "pwsh", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"])(
++        "passes a command to Windows PowerShell %s with its native flags",
++        async (shell) => {
++            const machine = new FakeMachine();
++            const command = "Get-Content -LiteralPath 'C:\\çığ\\çıktı.txt' -Encoding UTF8";
++            await factoryOn(machine, "win32").start({
++                cols: 80,
++                rows: 24,
++                cwd: "C:\\çığ",
++                shell,
++                command,
++            });
++            expect(machine.started[0]).toMatchObject({
++                command: shell,
++                args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
++            });
++            const interactive = new FakeMachine();
++            await factoryOn(interactive, "win32").start({
++                cols: 80,
++                rows: 24,
++                cwd: "C:\\çığ",
++                shell,
++            });
++            expect(interactive.started[0]).toMatchObject({ command: shell, args: [] });
++        },
++    );
+     it("starts the machine's own shell under a terminal in the folder", async () => {
+         const machine = new FakeMachine();
+         const terminal = await factoryOn(machine, "linux").start({
+diff --git a/packages/happy-agent/API.md b/packages/happy-agent/API.md
+index 06390f8..8279b1e 100644
+--- a/packages/happy-agent/API.md
++++ b/packages/happy-agent/API.md
+@@ -8708,6 +8708,18 @@ Response — `200`:
+   `totalTokens` from its own recorded usage, or `null` when none has been recorded.
+ - `processes` — full process objects, including exited ones.
+ 
++Current daemons also include optional `subagentExecution`, keyed only by IDs in this snapshot's
++`subagents`. The focused agent bootstrap includes the same optional field. Each value is
++`{ modelId: string | null, latestRun: null | { id, status, reason, startedAt, endedAt } }`.
++`modelId` is the child's current configured model, or null when unavailable. `latestRun` is its
++newest durable run by run sequence, including message-less runs; null means no recorded run.
++Run status is `running`, `completed`, `aborted`, or `failed`; reason is null, `completed`,
++`steering`, `abort`, or `error`. Times are server-recorded epoch milliseconds; `endedAt` is null
++while the run is open. This metadata contains no transcript, tool data, usage, or inferred queue
++count. A completed run proves that execution ended, not that a coordinator verified its task.
++Existing child `run.started`, `run.finished`, and agent events invalidate the snapshot; no new
++event is introduced. Older daemons may omit the field.
++
+ `404` when no such agent exists. On a subagent the endpoint works normally — subagents can
+ spawn their own subagents and processes.
+ 
+@@ -9261,6 +9273,18 @@ Surface data or history. Changing one member never changes another member's orde
+ catalog in ascending ID order with members nested in every Surface. The event cursor is captured
+ before snapshot reads. Unknown query fields are ignored.
+ 
++Optional additive query `coordinatorAgentId` selects only caller-visible Todo Surfaces containing
++at least one non-deleted execution todo for that coordinator. Both active and verified completed
++todos qualify; a Surface without such records is absent. The filter is a single 24-character
++CUID2 (`^[a-z][a-z0-9]{23}$`); malformed, empty, or repeated values return `400 invalid_request`.
++The coordinator must exist, be non-archived, and be accessible to the caller, otherwise
++`404 not_found`. Filtering does not grant access to an agent, Surface, or its todos, expose hidden
++references, alter sidebar membership, or create a Surface. The unfiltered catalog is unchanged.
++Filtered reads use an atomically maintained coordinator/Surface index instead of reading unrelated
++todo history; creating, deleting, or retrying execution todos keeps that index consistent with
++the committed head. The returned cursor retains the same pre-snapshot semantics. Clients reconcile
++on existing Surface and Todo events and reconnect; the filter is not a new event channel.
++
+ `POST /v0/surfaces` accepts `{ "id": "...", "type": "todo", "name": "Shopping",
+ "mutationId": "..." }`; `id` and `mutationId` are optional. It creates one independent empty
+ list, records the authenticated caller as `creatorUserId` (`null` in standalone mode), joins
+@@ -9385,6 +9409,87 @@ malformed headers return `400 invalid_request`; stale ones return `409 conflict`
+ `404 not_found`. Invalid bodies, unsupported fields, invalid list scope, or malformed paging
+ parameters return `400 invalid_request`. Creation and Surface member mutations do not use `If-Match`.
+ 
++### Optional Todo execution
++
++A todo may additionally contain `execution`. Absence preserves the plain Todo contract;
++neither reads nor edits create this field implicitly. It is the durable plan of the explicit
++`coordinatorAgentId`, not a Task conversation's archive state or a projection of transcript text.
++
++```ts
++execution?: {
++    coordinatorAgentId: Cuid2;
++    projectId?: Cuid2;
++    assigneeAgentId?: Cuid2;
++    phase: "pending" | "in_progress" | "awaiting_input" | "blocked" |
++        "verifying" | "completed" | "failed" | "cancelled";
++    dependsOn: Cuid2[];
++    attempt: { id: Cuid2; runId?: Cuid2; startedAt?: number; finishedAt?: number };
++    evidence: (
++        { kind: "agent_message"; agentId: Cuid2; messageId: Cuid2 } |
++        { kind: "artifact"; artifactId: Cuid2 }
++    )[];
++    verification?: { userId: UserId | null; agentId: Cuid2 | null; acceptedAt: number };
++}
++```
++
++`dependsOn` and `evidence` have at most 64 distinct entries. All referenced identities are real
++installation records, checked under the caller's existing access. A project, when supplied,
++must be the coordinator's project. An assignee is the coordinator itself or its accessible child
++or subtask agent; names, model labels, and shared Surface membership do not establish this link.
++Dependencies belong to the same Surface and coordinator; missing, self, and cyclic dependencies
++are invalid. Inaccessible references return `404 not_found`, malformed or inconsistent input
++returns `400 invalid_request`, and forbidden actors return `403 forbidden` without partial writes.
++
++Creation accepts optional `execution: { coordinatorAgentId, projectId?, dependsOn? }`.
++HTTP callers must be able to administer the selected coordinator; tools take the executing
++agent as coordinator and reject another identity. The server starts `pending`, generates the
++attempt ID, defaults dependencies to `[]`, and records empty evidence. The association and
++project are immutable. Existing plain todos cannot gain execution through an update.
++
++Updates accept optional `execution` containing a non-empty subset of `assigneeAgentId`
++(CUID2 or null to clear), `phase`, `runId` (CUID2), `dependsOn`, and `evidence`, or the distinct
++`{ retry: true }` operation. Arrays replace the entire current array. Callers cannot supply
++attempt IDs, timestamps, verification, or coordinator/project changes. A retry cannot be
++combined with other execution edits, text, or status changes, and requires a non-empty
++`mutationId` (1–256 characters). It is allowed only from completed, failed, or cancelled;
++it creates one fresh pending attempt, clears evidence and verification, and retains assignment
++and dependencies. A retry receipt is scoped to Surface, todo, actor, and mutation ID: a repeated
++retry returns its committed todo snapshot without another attempt, revision, or event, even
++with the original stale `If-Match`; malformed headers and access still fail. Other mutations
++keep the existing echo-only mutation ID and version-check semantics. Reusing a retry mutation
++ID for a different request is `409 conflict`.
++
++The coordinator or an authenticated person authorized to administer it may edit execution.
++The assigned child may only update its own phase to `in_progress`, `awaiting_input`, `blocked`,
++`verifying`, `failed`, or `cancelled`, and attach its run and evidence. It cannot change the
++assignment, dependencies, coordinator, text, or base status, retry a task, or verify completion.
++Both API and tool paths enforce this actor rule; Surface access alone does not grant it.
++Standalone HTTP is the installation owner. Identity never grants new filesystem or tool access.
++
++`in_progress` requires an assignee and a real run belonging to it. Run binding is immutable
++within an attempt. Assignment cannot change once a run is bound; retry opens a new attempt.
++The server reads start and finish timestamps from the bound run, never from todo creation
++or caller clocks. A bound run must be terminal before completed, failed, or cancelled is
++accepted; terminal execution without a bound run has no run timestamps. A settled attempt
++never continues accumulating duration. An idle agent is not evidence of completed work.
++
++Completing execution requires the coordinator's or authorized person's explicit update,
++at least one existing accessible evidence record, and all dependencies completed and verified.
++A message reference belongs to its specified agent and evidence is checked for existence and
++access; the server does not judge whether a reported test actually passed. Completion records
++the trusted actor and server acceptance time in verification. Other phases have no verification.
++Execution completion derives base `status=completed`; all other phases derive `status=active`
++unless explicitly deleted. An explicitly supplied status must agree; a status-only completion
++of an execution todo is rejected so old clients cannot bypass evidence checks. Terminal attempts
++cannot change phase, assignment, run, dependencies, or evidence except through retry. Deleted
++execution todos retain their full snapshot and permanent revisions, leave the active board,
++and cannot be reactivated by a plain status update. Deletion does not stop an agent or delete files.
++
++Execution edits follow the same optimistic version checks, atomic head/revision/notification
++commit and permanent history as ordinary todo edits. `todo.updated.changes.execution`, when
++present, is the entire new execution snapshot. No duplicate or older event may replace a newer
++client snapshot. Reconnect reconciles through the existing Surface difference mechanism.
++
+ ### Todo routes
+ 
+ The collection prefix is `/v0/surfaces/todo/:surfaceId`. There is no generic single-Surface read
+@@ -9399,7 +9504,8 @@ Active ordering, creation retry IDs, and history are isolated to their Surface.
+   then ID, without paging. Completed and deleted scopes sort newest `completedAt` and
+   `deletedAt` first, respectively, then ID. `all` groups active, completed, and deleted in
+   that order with the same within-group ordering. The cursor precedes snapshot reads.
+-- `POST` accepts `{ "text": "Pick up groceries", "id": "...", "mutationId": "..." }`. `id`
++- `POST` accepts `{ "text": "Pick up groceries", "id": "...", "mutationId": "..." }` and
++  optional `execution` as defined above. `id`
+   and `mutationId` are optional. Creation records the authenticated caller as `authorUserId`
+   (`null` in standalone mode), inserts an active todo at the top of the active list with a new
+   fractional key before its first item (without changing existing keys), and returns
+@@ -9408,8 +9514,9 @@ Active ordering, creation retry IDs, and history are isolated to their Surface.
+   are ignored. This ID is the creation retry key; `mutationId` remains only an echo. HTTP request
+   bodies cannot supply `authorUserId`, on creation or any subsequent mutation.
+ - `GET /:todoId` returns `200 { "todo": {...} }`, including deleted tombstones.
+-- `PATCH /:todoId` accepts `{ "text": "...", "status": "completed", "mutationId": "..." }`.
+-  At least one of `text` or `status` is required. Status is `active`, `completed`, or `deleted`.
++- `PATCH /:todoId` accepts `{ "text": "...", "status": "completed", "mutationId": "..." }`
++  and optional `execution` as defined above. At least one of `text`, `status`, or `execution`
++  is required. Status is `active`, `completed`, or `deleted`.
+   Omitting it keeps the current status. Text may be edited in any state. Moving an inactive
+   todo to `active` clears both lifecycle timestamps and appends a fresh key at the active tail.
+   Moving to `completed` clears the key and deletion timestamp and sets a new completion time.
+@@ -9445,6 +9552,10 @@ updates allow any prior editable state to be applied without rewriting its origi
+ Every ordinary agent model receives fixed common tools `list_surfaces`, `list_todos`,
+ `create_todo`, `update_todo`, `reorder_todo`, `delete_todo`, and `list_todo_versions`.
+ They call the same strict typed operations as the API.
++`list_surfaces` accepts the same optional `coordinatorAgentId` filter and access rules as the
++catalog route. `create_todo` and `update_todo` also accept the optional execution inputs above and enforce
++the same actor, run, evidence, dependency, retry, and version rules. Model tools may not supply
++trusted timestamps, verification, or another coordinator's identity.
+ `create_todo` requires an explicit `authorUserId` parameter: an installation-local Happy user ID
+ or `null`. The model must supply it; the daemon never infers it from the execution context.
+ It sets the todo's immutable author, not the revision actor.
+diff --git a/packages/happy-agent/package.json b/packages/happy-agent/package.json
+index 6516348..5994a0e 100644
+--- a/packages/happy-agent/package.json
++++ b/packages/happy-agent/package.json
+@@ -51,7 +51,7 @@
+     "dependencies": {
+         "@sinclair/typebox": "^0.34.49",
+         "@slopus/happy-agent-base": "0.0.67",
+-        "@slopus/happy-agent-client": "0.0.151",
++        "@slopus/happy-agent-client": "workspace:*",
+         "@slopus/happy-agent-compute": "0.1.30",
+         "@slopus/happy-agent-modules": "workspace:*",
+         "@slopus/happy-agent-supervisor": "0.0.20",
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 36a40c9..5673be1 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -86,8 +86,8 @@ importers:
+         specifier: 0.0.67
+         version: 0.0.67(@opentelemetry/api@1.9.1)(@types/pg@8.15.6)(sql.js@1.14.1)(ws@8.21.1)(zod@4.4.3)
+       '@slopus/happy-agent-client':
+-        specifier: 0.0.151
+-        version: 0.0.151
++        specifier: workspace:*
++        version: link:../happy-agent-client
+       '@slopus/happy-agent-compute':
+         specifier: 0.1.30
+         version: 0.1.30
+@@ -244,8 +244,8 @@ importers:
+         specifier: npm:@slopus/happy-agent-base@0.0.67
+         version: 0.0.67(@opentelemetry/api@1.9.1)(@types/pg@8.15.6)(sql.js@1.14.1)(ws@8.21.1)(zod@4.4.3)
+       '@slopus/happy-agent-client':
+-        specifier: 0.0.151
+-        version: 0.0.151
++        specifier: workspace:*
++        version: link:../happy-agent-client
+       '@slopus/happy-agent-compute':
+         specifier: npm:@slopus/happy-agent-compute@0.1.30
+         version: 0.1.30
+@@ -284,8 +284,8 @@ importers:
+         specifier: ^0.34.49
+         version: 0.34.49
+       '@slopus/happy-agent-client':
+-        specifier: 0.0.151
+-        version: 0.0.151
++        specifier: workspace:*
++        version: link:../happy-agent-client
+       '@slopus/happy-agent-gym':
+         specifier: workspace:*
+         version: link:../happy-agent-gym
+@@ -371,8 +371,8 @@ importers:
+         specifier: 0.1.3
+         version: 0.1.3
+       '@slopus/happy-agent-client':
+-        specifier: 0.0.151
+-        version: 0.0.151
++        specifier: workspace:*
++        version: link:../happy-agent-client
+       '@slopus/happy-agent-compute':
+         specifier: npm:@slopus/happy-agent-compute@0.1.30
+         version: 0.1.30

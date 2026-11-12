@@ -7,11 +7,11 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-macos-engine-0.4.126
+    group: cyberfi-macos-engine-0.4.127
     cancel-in-progress: false
 
 env:
-    HAPPY_AGENT_RELEASE_VERSION: "0.4.126"
+    HAPPY_AGENT_RELEASE_VERSION: "0.4.127"
 
 jobs:
     macos:
@@ -55,17 +55,23 @@ jobs:
               with:
                   path: ${{ steps.store.outputs.path }}
                   key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node${{ steps.store.outputs.abi }}-${{ hashFiles('pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'patches/**') }}
-            - name: Install and rebuild patched native dependencies
-              run: pnpm install --frozen-lockfile --config.side-effects-cache=false
             - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
                   path: cyberfi-overlay
                   persist-credentials: false
-            - name: Apply CyberFi tray and voice defaults before compiling JavaScript
+            - name: Apply CyberFi source and local client before dependency installation
+              run: node cyberfi-overlay/macos/markala-macos.mjs .
+            - name: Install and rebuild patched native dependencies
+              run: pnpm install --frozen-lockfile --config.side-effects-cache=false
+            - name: Patch and verify the installed compute SDK
               run: |
-                  node cyberfi-overlay/macos/markala-macos.mjs .
                   node cyberfi-overlay/branding/patch-compute-sdk.mjs --self-check
                   node cyberfi-overlay/branding/patch-compute-sdk.mjs .
+            - name: Build and verify the local client and execution contract
+              run: |
+                  pnpm --filter @slopus/happy-agent-client build
+                  pnpm --filter @slopus/happy-agent-client test
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/runtime/surfaceExecutionApi.test.ts tests/runtime/subagentExecutionApi.test.ts tests/surfaces/TodoExecution.test.ts tests/history/HistoryRuns.test.ts tests/terminals/createMachineTerminalProcessFactory.test.ts tests/collaboration/CollaborationModule.test.ts --maxWorkers=1
             - name: Verify MCP names, optional searches and narrow command runtime permissions
               run: |
                   node --test cyberfi-overlay/branding/command-tool-read-policy.test.mjs
@@ -81,6 +87,7 @@ jobs:
             - name: Build workspace JavaScript
               run: |
                   pnpm --filter @slopus/happy-agent-supervisor build
+                  pnpm --filter @slopus/happy-agent-client build
                   pnpm --filter @slopus/happy-providers build
                   pnpm --filter @slopus/happy-agent-compute build
                   pnpm --filter @slopus/happy-agent-modules build
@@ -207,12 +214,12 @@ jobs:
                   release="repos/$GITHUB_REPOSITORY/releases/$release_id"
                   gh api "$release" > before.json
                   jq -e --arg source "$GITHUB_SHA" '.draft == true and .prerelease == false and .target_commitish == $source' before.json > /dev/null
-                  jq -e '.assets | any(.name == "happy-agent-0.4.126-win32-x64.tar.gz")' before.json > /dev/null
+                  jq -e '.assets | any(.name == "happy-agent-0.4.127-win32-x64.tar.gz")' before.json > /dev/null
                   jq -e '.assets | all(.name | contains("darwin-") | not)' before.json > /dev/null
                   jq -S '[.assets[] | {id, name, size, digest, browser_download_url}] | sort_by(.id)' before.json > preserved.json
                   gh release upload "v$HAPPY_AGENT_RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
-                    happy-agent-0.4.126-darwin-x64.tar.gz happy-agent-0.4.126-darwin-x64.tar.gz.sha256 \
-                    happy-agent-0.4.126-darwin-arm64.tar.gz happy-agent-0.4.126-darwin-arm64.tar.gz.sha256
+                    happy-agent-0.4.127-darwin-x64.tar.gz happy-agent-0.4.127-darwin-x64.tar.gz.sha256 \
+                    happy-agent-0.4.127-darwin-arm64.tar.gz happy-agent-0.4.127-darwin-arm64.tar.gz.sha256
                   gh api "$release" > after.json
                   jq -S '[.assets[] | select(.name | contains("darwin-") | not) | {id, name, size, digest, browser_download_url}] | sort_by(.id)' after.json > retained.json
                   cmp preserved.json retained.json
@@ -222,4 +229,4 @@ jobs:
                         '.assets | any(.name == $name and .digest == $digest)' after.json > /dev/null
                   done
                   jq -e '.draft == true and .prerelease == false and (.assets | length == 6)' after.json > /dev/null
-                  echo 'All three native architectures validated in draft v0.4.126; publication and Latest remain held.' >> "$GITHUB_STEP_SUMMARY"
+                  echo 'All three native architectures validated in draft v0.4.127; publication and Latest remain held.' >> "$GITHUB_STEP_SUMMARY"

@@ -145,20 +145,30 @@ jobs:
               with:
                   pattern: windows-native-*
                   merge-multiple: true
-            - name: Install dependencies
-              # Cache downloads only; patched native addons must run their install scripts again.
-              run: pnpm install --frozen-lockfile --config.side-effects-cache=false
             - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
                   path: cyberfi-overlay
                   persist-credentials: false
-            - name: Apply CyberFi tray and voice defaults before compiling JavaScript
+            - name: Apply CyberFi source and local client before dependency installation
               run: |
                   ./cyberfi-overlay/windows/Markala-Windows-Tepsisi.ps1 -EngineSource .
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Install dependencies
+              # Cache downloads only; patched native addons must run their install scripts again.
+              run: pnpm install --frozen-lockfile --config.side-effects-cache=false
+            - name: Patch and verify the installed compute SDK
+              run: |
                   node cyberfi-overlay/branding/patch-compute-sdk.mjs --self-check
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   node cyberfi-overlay/branding/patch-compute-sdk.mjs .
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Build and verify the local client and execution contract
+              run: |
+                  pnpm --filter @slopus/happy-agent-client build
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  pnpm --filter @slopus/happy-agent-client test
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/runtime/surfaceExecutionApi.test.ts tests/runtime/subagentExecutionApi.test.ts tests/surfaces/TodoExecution.test.ts tests/history/HistoryRuns.test.ts tests/terminals/createMachineTerminalProcessFactory.test.ts tests/collaboration/CollaborationModule.test.ts --maxWorkers=1
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             - name: Verify MCP names, optional searches and narrow command runtime permissions
               run: |
