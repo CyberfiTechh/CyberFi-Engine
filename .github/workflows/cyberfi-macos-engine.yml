@@ -7,11 +7,11 @@ permissions:
     contents: read
 
 concurrency:
-    group: cyberfi-macos-engine-0.4.127
+    group: cyberfi-macos-engine-0.4.128
     cancel-in-progress: false
 
 env:
-    HAPPY_AGENT_RELEASE_VERSION: "0.4.127"
+    HAPPY_AGENT_RELEASE_VERSION: "0.4.128"
 
 jobs:
     macos:
@@ -92,6 +92,11 @@ jobs:
                   pnpm --filter @slopus/happy-agent-compute build
                   pnpm --filter @slopus/happy-agent-modules build
                   pnpm --filter @slopus/happy-agent build
+            - name: Verify exact provider binding and evidence-backed child completion
+              run: |
+                  pnpm --filter @slopus/happy-providers exec vitest run tests/vendors/codexToolSearch.test.ts --maxWorkers=1
+                  pnpm --filter @slopus/happy-agent exec vitest run tests/verifyProviderBinding.test.ts --maxWorkers=1
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/history/HistoryFormatting.test.ts tests/history/HistoryTool.test.ts tests/history/executionDiagnosticsStayOutOfModelContext.test.ts tests/surfaces/TodoExecution.test.ts tests/auto/AutoModuleReview.test.ts tests/workspaces/WorkspaceArchiveStopsWork.test.ts --maxWorkers=1
             - name: Identify pinned database build inputs
               id: libsql
               run: |
@@ -214,12 +219,12 @@ jobs:
                   release="repos/$GITHUB_REPOSITORY/releases/$release_id"
                   gh api "$release" > before.json
                   jq -e --arg source "$GITHUB_SHA" '.draft == true and .prerelease == false and .target_commitish == $source' before.json > /dev/null
-                  jq -e '.assets | any(.name == "happy-agent-0.4.127-win32-x64.tar.gz")' before.json > /dev/null
+                  jq -e '.assets | any(.name == "happy-agent-0.4.128-win32-x64.tar.gz")' before.json > /dev/null
                   jq -e '.assets | all(.name | contains("darwin-") | not)' before.json > /dev/null
                   jq -S '[.assets[] | {id, name, size, digest, browser_download_url}] | sort_by(.id)' before.json > preserved.json
                   gh release upload "v$HAPPY_AGENT_RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
-                    happy-agent-0.4.127-darwin-x64.tar.gz happy-agent-0.4.127-darwin-x64.tar.gz.sha256 \
-                    happy-agent-0.4.127-darwin-arm64.tar.gz happy-agent-0.4.127-darwin-arm64.tar.gz.sha256
+                    happy-agent-0.4.128-darwin-x64.tar.gz happy-agent-0.4.128-darwin-x64.tar.gz.sha256 \
+                    happy-agent-0.4.128-darwin-arm64.tar.gz happy-agent-0.4.128-darwin-arm64.tar.gz.sha256
                   gh api "$release" > after.json
                   jq -S '[.assets[] | select(.name | contains("darwin-") | not) | {id, name, size, digest, browser_download_url}] | sort_by(.id)' after.json > retained.json
                   cmp preserved.json retained.json
@@ -229,4 +234,4 @@ jobs:
                         '.assets | any(.name == $name and .digest == $digest)' after.json > /dev/null
                   done
                   jq -e '.draft == true and .prerelease == false and (.assets | length == 6)' after.json > /dev/null
-                  echo 'All three native architectures validated in draft v0.4.127; publication and Latest remain held.' >> "$GITHUB_STEP_SUMMARY"
+                  echo 'All three native architectures validated in draft v0.4.128; publication and Latest remain held.' >> "$GITHUB_STEP_SUMMARY"

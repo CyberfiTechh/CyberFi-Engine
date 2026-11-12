@@ -2,15 +2,15 @@
 
 CyberFi masaüstü uygulamasının ajan motoru dağıtımı. Kaynak [Happy Agent](https://github.com/slopus/happy-agent), MIT lisansı ve [özgün bildirim](LICENSE-Happy-Agent.txt) korunur.
 
-## 0.4.119 hazırlığı
+## 0.4.128 hazırlığı
 
-Bu sürüm MCP teknik kimliği/görünen ad eşleşmesini, hesap tanımlı olmayan isteğe bağlı aramaların hata olarak işaretlenmesini ve yönetilen Python/ripgrep araçlarının dar salt okuma erişimini düzeltir. Gerçek ağ, kimlik doğrulama ve izin hataları gizlenmez. Var olan beceriler, kullanıcı ayarları, CyberFi simgesi ve Türkçe ses yönergeleri korunur.
+Bu aday sürüm, açık araç kimliği arandığında doğru aracı önce getirir; böylece yönetici alt ajanları gereksiz keşif turları olmadan başlatabilir. Alt ajan geçmişindeki sınırlı mesaj ve çalışma kimlikleri, yöneticinin sonuçları gerçek kanıtla doğrulayıp görevleri Bitti sütununa taşımasını sağlar. Keşif çağrısı sınırı, erişim kontrolleri ve geçmişin bağlam bütçesi korunur.
 
-Upstream kaynak `3d672e414d70804cf9f1b20b44d7243c78e063c3` sabittir. `branding/apply.mjs` yalnız doğrulanan kaynak yamasını uygular. Yayımlanan `@slopus/happy-agent-compute@0.1.30` bağımlılığına ait mevcut yama, kanonik tek SDK dosyasını ve sürümünü denetler; paylaşılan pnpm önbelleğini değiştirmez.
+Kanonik düzeltilmiş kaynak `28203c23edc5a6d30c6f908601618b3abd25ba99`; sabit upstream `3d672e414d70804cf9f1b20b44d7243c78e063c3` üzerine önceki yamalar ve `branding/provider-history-completion.patch` uygulanır. `branding/engine128-source.json` 18 dosyanın özetlerini kaydeder. Yayımlanmış `@slopus/happy-providers@0.0.53`, pnpm yaması ve donmuş kilit dosyasıyla kullanılır; derleme öncesi kontrol gerçek çözümlenen modülün kanonik derlenmiş dosyayla birebir eşleşmesini zorunlu tutar. Önceki çalışma planı ve 126 yamaları değiştirilmez.
 
-Windows hattı `v0.4.119` taslağını oluşturur; Intel ve ARM Mac hattı aynı taslağa yalnız eksik varlıkları ekler. Altı arşiv/özet varlığı ve üç mimarinin yerel kontrolleri doğrulanmadan genel yayın yapılmaz. Önceki motor yayınları veya varlıkları değiştirilmez.
+Windows hattı yeni `v0.4.128` taslağını oluşturur; Intel ve ARM Mac hattı aynı taslağa yalnız eksik varlıkları ekler. Üç mimari, altı arşiv/özet varlığı ve masaüstü kabul kontrolleri tamamlanmadan kararlı yayın yapılmaz. Önceki yayınlar ve varlıklar korunur.
 
-Derleme; MCP/arama regresyonlarını, dar okuma politikalarını, yerel taşıma ve veritabanı/worker kontrollerini, gerçek derlenmiş motorda beceri/alt ajan sınırlarını, MCP ad eşleşmesini ve hesapsız arama sonucunu test eder. Windows imzası mevcut imzalama ayarlarına bağlıdır; Mac dosyaları ad hoc imzalıdır, Apple Developer ID/noter onayı yoktur.
+Windows özel motor denemesinde gerçek yönetici iki alt ajanı başlatıp sonuçlarını doğrulayarak iki görevi tamamladı. Üç mimarinin sürüm 128 yerel kontrolleri ayrıca CI üzerinde çalışır. CyberFi simgeleri, Türkçe ses varsayılanları, MCP kimlikleri, kullanıcı ayarları, Unicode komutları ve dosyaları koruyan arşivleme davranışı korunur. Mac imzası ad hoc olup Developer ID/noter onayı değildir.
 
 ```sh
 gh workflow run cyberfi-windows-engine.yml --repo CyberfiTechh/CyberFi-Engine --ref main

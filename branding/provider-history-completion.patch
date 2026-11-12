@@ -1,0 +1,949 @@
+diff --git a/package.json b/package.json
+index eab750b..587a323 100644
+--- a/package.json
++++ b/package.json
+@@ -80,7 +80,8 @@
+         "patchedDependencies": {
+             "libsql@0.5.29": "patches/libsql@0.5.29.patch",
+             "@libsql/client@0.18.0": "patches/@libsql__client@0.18.0.patch",
+-            "@parcel/watcher@2.6.0": "patches/@parcel__watcher@2.6.0.patch"
++            "@parcel/watcher@2.6.0": "patches/@parcel__watcher@2.6.0.patch",
++            "@slopus/happy-providers@0.0.53": "patches/@slopus__happy-providers@0.0.53.patch"
+         },
+         "packageExtensions": {
+             "@parcel/watcher@2.6.0": {
+diff --git a/packages/happy-agent-modules/sources/history/LEARNINGS.md b/packages/happy-agent-modules/sources/history/LEARNINGS.md
+index 3f9a06a..72da7e4 100644
+--- a/packages/happy-agent-modules/sources/history/LEARNINGS.md
++++ b/packages/happy-agent-modules/sources/history/LEARNINGS.md
+@@ -1,5 +1,15 @@
+ # History learnings
+ 
++## Readable history exposes authoritative task evidence identities
++
++The simplified history text omitted stored message and run identities, leaving a coordinator
++unable to bind an execution Todo to a real child run or cite its answer without guessing.
++`read_agent_history` now returns optional typed `message_refs` from only the readable messages
++that fit its selected page, after the existing target permission and query filters. References
++and readable text share the existing 80,000-character budget. Configuration-only records expose
++no reference; a run-less message omits `run_id`. A reference establishes identity only, never
++successful completion or coordinator verification, which the Todo module still validates.
++
+ ## Activity reads lifecycle metadata without transcript pages
+ 
+ An idle child does not prove successful completion, and reading its whole last run to discover
+diff --git a/packages/happy-agent-modules/sources/history/impl/formatHistoryPage.ts b/packages/happy-agent-modules/sources/history/impl/formatHistoryPage.ts
+index 7759fca..450b7e3 100644
+--- a/packages/happy-agent-modules/sources/history/impl/formatHistoryPage.ts
++++ b/packages/happy-agent-modules/sources/history/impl/formatHistoryPage.ts
+@@ -1,4 +1,5 @@
+ import type { HistoryPage } from "../HistoryPage.js";
++import type { HistoryMessage } from "../HistoryMessage.js";
+ import { formatHistoryMessage, truncate } from "./formatHistoryMessage.js";
+ import { summarizeHistory, type HistoryStats } from "./summarizeHistory.js";
+ 
+@@ -15,6 +16,15 @@ export interface FormattedHistoryPage {
+     readonly startIndex: number;
+     /** What the rendered messages amount to. */
+     readonly stats: HistoryStats;
++    /** Stable references to the readable messages that actually fit, when requested. */
++    readonly messageRefs?: readonly HistoryMessageReference[];
++}
++
++export interface HistoryMessageReference {
++    readonly message_id: string;
++    readonly run_id?: string;
++    readonly position: number;
++    readonly role: HistoryMessage["role"];
+ }
+ 
+ /**
+@@ -27,14 +37,32 @@ export interface FormattedHistoryPage {
+  */
+ export function formatHistoryPage(
+     page: HistoryPage,
+-    options: { fromEnd?: boolean; includeTools?: boolean } = {},
++    options: { fromEnd?: boolean; includeTools?: boolean; includeMessageReferences?: boolean } = {},
+ ): FormattedHistoryPage {
+     const formatted = page.messages.map((record) =>
+         formatHistoryMessage(record.message, record.position + 1, {
+             includeTools: options.includeTools !== false,
+         }),
+     );
+-    const selected = selectBounded(formatted, options.fromEnd === true);
++    const references = options.includeMessageReferences
++        ? page.messages.map(({ message, position }, index): HistoryMessageReference | undefined =>
++              formatted[index] === ""
++                  ? undefined
++                  : {
++                        message_id: message.recordId,
++                        ...(message.runId === undefined ? {} : { run_id: message.runId }),
++                        position,
++                        role: message.role,
++                    },
++          )
++        : undefined;
++    const selected = selectBounded(
++        formatted,
++        options.fromEnd === true,
++        references?.map((reference) =>
++            reference === undefined ? 0 : JSON.stringify(reference).length + 1,
++        ),
++    );
+     return {
+         consumedMessages: selected.messages.length,
+         history: selected.messages.filter((message) => message !== "").join("\n\n"),
+@@ -44,6 +72,16 @@ export function formatHistoryPage(
+                 .slice(selected.startIndex, selected.startIndex + selected.messages.length)
+                 .map((record) => record.message),
+         ),
++        ...(references === undefined
++            ? {}
++            : {
++                  messageRefs: references
++                      .slice(selected.startIndex, selected.startIndex + selected.messages.length)
++                      .filter(
++                          (reference): reference is HistoryMessageReference =>
++                              reference !== undefined,
++                      ),
++              }),
+     };
+ }
+ 
+@@ -51,9 +89,11 @@ export function formatHistoryPage(
+ function selectBounded(
+     messages: readonly string[],
+     fromEnd: boolean,
++    referenceSizes?: readonly number[],
+ ): { messages: string[]; startIndex: number } {
+     const selected: string[] = [];
+-    let characters = 0;
++    // The existing 80k budget includes the optional JSON identity metadata, not just its text.
++    let characters = referenceSizes === undefined ? 0 : '{"message_refs":[]}'.length;
+     const indexes = fromEnd
+         ? Array.from({ length: messages.length }, (_, index) => messages.length - index - 1)
+         : messages.map((_, index) => index);
+@@ -61,13 +101,15 @@ function selectBounded(
+     for (const index of indexes) {
+         const message = messages[index] ?? "";
+         const separator = selected.length === 0 ? 0 : 2;
+-        const remaining = MAX_HISTORY_CHARACTERS - characters - separator;
++        const referenceSize = referenceSizes?.[index] ?? 0;
++        const remaining = MAX_HISTORY_CHARACTERS - characters - separator - referenceSize;
++        if (referenceSizes !== undefined && remaining <= 0) break;
+         if (selected.length > 0 && message.length > remaining) break;
+         const bounded = truncate(message, remaining);
+         if (fromEnd) selected.unshift(bounded);
+         else selected.push(bounded);
+         startIndex = fromEnd ? index : 0;
+-        characters += separator + bounded.length;
++        characters += separator + bounded.length + referenceSize;
+         if (characters >= MAX_HISTORY_CHARACTERS) break;
+     }
+     return { messages: selected, startIndex };
+diff --git a/packages/happy-agent-modules/sources/history/tools/read_agent_history.ts b/packages/happy-agent-modules/sources/history/tools/read_agent_history.ts
+index bccd4c1..3d86edf 100644
+--- a/packages/happy-agent-modules/sources/history/tools/read_agent_history.ts
++++ b/packages/happy-agent-modules/sources/history/tools/read_agent_history.ts
+@@ -5,6 +5,8 @@ import type { Context } from "@steve.kite/stdlib";
+ import type { HistoryModule } from "../HistoryModule.js";
+ import {
+     historyAgentIdSchema,
++    historyRecordIdSchema,
++    historyRoleSchema,
+     MAX_HISTORY_PAGE_SIZE,
+     MAX_HISTORY_POSITION,
+     MAX_HISTORY_QUERY_LENGTH,
+@@ -79,7 +81,7 @@ export function readAgentHistoryTool(history: HistoryModule, agentId: string, st
+         capabilities: ["Read the agent's durable conversation and tool history."],
+         searchKeywords: ["prior messages", "previous tool calls", "agent conversation history"],
+         description:
+-            "Read or search the durable low-level history of any agent. The response lists the agents it concerns with their stable IDs, message counts, paths, and statuses; any stable Agent ID may be read, including one that has recorded nothing yet. Use this to investigate prior requests, decisions, reasoning, tool activity, and subagent work after a model change or whenever earlier context matters. This is not a user-facing chat export. Search examines stored block content, but each response is simplified and capped at 80,000 characters: provider-hidden reasoning is unavailable, only exposed thinking is readable, tool calls are summarized, tool outputs are truncated, and images are represented only by metadata. A requested message limit may therefore return fewer messages; continue with next_cursor or previous_cursor.",
++            "Read or search the durable low-level history of any agent. The response lists the agents it concerns with their stable IDs, message counts, paths, and statuses; any stable Agent ID may be read, including one that has recorded nothing yet. Use this to investigate prior requests, decisions, reasoning, tool activity, and subagent work after a model change or whenever earlier context matters. message_refs gives the authoritative message_id and optional run_id for each readable returned message; use those IDs for Todo execution run binding and message evidence instead of guessing. A reference does not certify completion or verify a task. This is not a user-facing chat export. Search examines stored block content, but readable history and its references share an 80,000-character budget: provider-hidden reasoning is unavailable, only exposed thinking is readable, tool calls are summarized, tool outputs are truncated, and images are represented only by metadata. A requested message limit may therefore return fewer messages; continue with next_cursor or previous_cursor.",
+         parameters: Type.Object({
+             cursor: Type.Optional(
+                 Type.Integer({
+@@ -160,6 +162,20 @@ export function readAgentHistoryTool(history: HistoryModule, agentId: string, st
+                 maximum: MAX_HISTORY_TOTAL_MESSAGES,
+                 minimum: 0,
+             }),
++            message_refs: Type.Optional(
++                Type.Array(
++                    Type.Object(
++                        {
++                            message_id: historyRecordIdSchema,
++                            run_id: Type.Optional(historyRecordIdSchema),
++                            position: Type.Integer({ minimum: 0, maximum: MAX_HISTORY_POSITION }),
++                            role: historyRoleSchema,
++                        },
++                        { additionalProperties: false },
++                    ),
++                    { maxItems: MAX_HISTORY_PAGE_SIZE },
++                ),
++            ),
+             next_cursor: Type.Optional(
+                 Type.Integer({
+                     description:
+@@ -224,6 +240,7 @@ export function readAgentHistoryTool(history: HistoryModule, agentId: string, st
+             const formatted = formatHistoryPage(page, {
+                 fromEnd: from === "end",
+                 includeTools: args.include_tools !== false,
++                includeMessageReferences: true,
+             });
+             const cursor = page.messages[formatted.startIndex]?.position ?? page.cursor;
+             const next =
+@@ -237,6 +254,7 @@ export function readAgentHistoryTool(history: HistoryModule, agentId: string, st
+                 cursor,
+                 history: formatted.history,
+                 matched_messages: page.matchedMessages,
++                message_refs: (formatted.messageRefs ?? []).map((reference) => ({ ...reference })),
+                 ...(next === undefined ? {} : { next_cursor: next }),
+                 ...(previous === undefined ? {} : { previous_cursor: previous }),
+                 returned_messages: formatted.consumedMessages,
+diff --git a/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts b/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts
+index dd91ef5..6c1f6bc 100644
+--- a/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts
++++ b/packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts
+@@ -277,7 +277,7 @@ export function surfaceTools(surfaces: SurfacesModule, scope: AgentModuleScope,
+             capabilities: ["Change a todo's text or active, completed, or deleted state."],
+             searchKeywords: ["edit todo", "complete todo", "uncomplete todo", "change todo state"],
+             description:
+-                "Edit text or status (active, completed, deleted) with the current version. Execution items instead use execution.phase; only their coordinator accepts completed with existing message or artifact evidence after dependencies are verified. The assigned child may report its own progress, run and evidence, but cannot verify itself. in_progress requires its real run ID. Terminal attempts change only through execution:{retry:true}, which has a stable server mutation identity. Execution history and source files are preserved. Returning an ordinary inactive todo to active appends it to the list. To apply a historical plain todo state, read its revision and supply fields here; use reorder_todo for placement. Conflicts require a fresh read.",
++                "Edit text or status (active, completed, deleted) with the current version. Execution items instead use execution.phase; only their coordinator accepts completed with existing message or artifact evidence after dependencies are verified. The assigned child may report its own progress, run and evidence, but cannot verify itself. in_progress requires its real run ID. Read the assignee with read_agent_history: its returned message_refs provides run_id for execution.runId and message_id for agent_message evidence. Never invent those identities or treat a reference as successful verification. Terminal attempts change only through execution:{retry:true}, which has a stable server mutation identity. Execution history and source files are preserved. Returning an ordinary inactive todo to active appends it to the list. To apply a historical plain todo state, read its revision and supply fields here; use reorder_todo for placement. Conflicts require a fresh read.",
+             parameters: Type.Object(
+                 {
+                     ...guard,
+diff --git a/packages/happy-agent-modules/tests/auto/AutoModuleReview.test.ts b/packages/happy-agent-modules/tests/auto/AutoModuleReview.test.ts
+index 8164b6e..aa6079a 100644
+--- a/packages/happy-agent-modules/tests/auto/AutoModuleReview.test.ts
++++ b/packages/happy-agent-modules/tests/auto/AutoModuleReview.test.ts
+@@ -156,11 +156,11 @@ async function reviewWorld(
+         await installation.writeGlobalSecurity(options.globalSecurity);
+     }
+     if (options.unreadableGlobalSecurity === true) {
+-        // A link to itself: reading it fails with ELOOP, which is neither an absent file nor half a
+-        // policy, so the review must fail rather than judge against what it could read.
++        // A self-link fails with ELOOP before any partial policy can reach review.
++        // Windows junctions preserve that failure without requiring symlink elevation.
+         const path = installation.config.configuration.paths.securityPath;
+         await mkdir(dirname(path), { recursive: true });
+-        await symlink(path, path);
++        await symlink(path, path, process.platform === "win32" ? "junction" : "file");
+     }
+     if (options.projectSecurity !== undefined) {
+         await installation.writeProjectSecurity(options.projectSecurity);
+diff --git a/packages/happy-agent-modules/tests/history/HistoryFormatting.test.ts b/packages/happy-agent-modules/tests/history/HistoryFormatting.test.ts
+index 51304ea..580222a 100644
+--- a/packages/happy-agent-modules/tests/history/HistoryFormatting.test.ts
++++ b/packages/happy-agent-modules/tests/history/HistoryFormatting.test.ts
+@@ -21,6 +21,52 @@ function pageWithMessages(messages: HistoryPage["messages"]): HistoryPage {
+ }
+ 
+ describe("history rendering", () => {
++    it("does not let 500 long identities expand a short-text response beyond its budget", () => {
++        const page = pageWithMessages(
++            Array.from({ length: 500 }, (_, position) => ({
++                position,
++                message: {
++                    recordId: `${position}`.padEnd(256, "m"),
++                    runId: `${position}`.padEnd(256, "r"),
++                    role: "assistant" as const,
++                    blocks: [{ type: "text" as const, text: "Done" }],
++                },
++            })),
++        );
++        const formatted = formatHistoryPage(page, { includeMessageReferences: true });
++        expect(formatted.consumedMessages).toBeGreaterThan(0);
++        expect(formatted.consumedMessages).toBeLessThan(500);
++        expect(formatted.messageRefs).toHaveLength(formatted.consumedMessages);
++        expect(
++            formatted.history.length +
++                JSON.stringify({ message_refs: formatted.messageRefs }).length,
++        ).toBeLessThanOrEqual(MAX_HISTORY_CHARACTERS);
++    });
++    it("keeps optional identity metadata inside the same budget in both paging directions", () => {
++        const page = pageWithMessages(
++            Array.from({ length: 12 }, (_, index) => ({
++                position: index,
++                message: {
++                    recordId: `message-${index}`,
++                    runId: `run-${index}`,
++                    role: "assistant" as const,
++                    blocks: [{ type: "text" as const, text: "x".repeat(12_000) }],
++                },
++            })),
++        );
++        for (const fromEnd of [false, true]) {
++            const result = formatHistoryPage(page, { fromEnd, includeMessageReferences: true });
++            expect(
++                result.history.length + JSON.stringify({ message_refs: result.messageRefs }).length,
++            ).toBeLessThanOrEqual(MAX_HISTORY_CHARACTERS);
++            expect(result.messageRefs?.map((reference) => reference.position)).toEqual(
++                page.messages
++                    .slice(result.startIndex, result.startIndex + result.consumedMessages)
++                    .map((record) => record.position),
++            );
++        }
++        expect(formatHistoryPage(page)).not.toHaveProperty("messageRefs");
++    });
+     it("reports truncation without exceeding the requested limit", () => {
+         expect(truncate("short", 10)).toBe("short");
+         expect(truncate("0123456789", 10)).toBe("0123456789");
+diff --git a/packages/happy-agent-modules/tests/history/HistoryTool.test.ts b/packages/happy-agent-modules/tests/history/HistoryTool.test.ts
+index 5e11e5d..c1d7eef 100644
+--- a/packages/happy-agent-modules/tests/history/HistoryTool.test.ts
++++ b/packages/happy-agent-modules/tests/history/HistoryTool.test.ts
+@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
+ 
+ import { HistoryModule } from "../../sources/history/HistoryModule.js";
+ import type { HistoryMessage } from "../../sources/history/HistoryMessage.js";
++import type { BotSettingsModule } from "../../sources/botSettings/index.js";
+ import { moduleDatabase } from "../support/moduleDatabase.js";
+ import { resolveModuleHooks } from "../support/moduleHooks.js";
+ 
+@@ -28,6 +29,57 @@ async function toolFor(
+ }
+ 
+ describe("read_agent_history", () => {
++    it("returns authoritative references only for the selected target, role and query", async () => {
++        const history = new HistoryModule(undefined, {
++            mayReach: async (_ctx: unknown, _reader: string, target: string) =>
++                target === "agent-b",
++        } as BotSettingsModule);
++        const database = moduleDatabase(history.migrations, "history-tool-references");
++        await database.ready;
++        try {
++            await history.record(database.context, "agent-b", {
++                ...textMessage("answer-id", "verified answer"),
++                runId: "real-run-id",
++            });
++            await history.record(
++                database.context,
++                "agent-b",
++                textMessage("runless-id", "other note"),
++            );
++            await history.record(
++                database.context,
++                "agent-b",
++                textMessage("user-id", "verified answer", "user"),
++            );
++            await history.record(
++                database.context,
++                "outsider",
++                textMessage("private-id", "verified answer"),
++            );
++            const tool = await toolFor(history, database);
++            const call = (args: Record<string, unknown>) =>
++                tool.execute(database.context, args, {
++                    id: "references-call",
++                    kv: {},
++                } as never) as Promise<Record<string, unknown>>;
++            const result = await call({
++                target: "agent-b",
++                query: "verified",
++                roles: ["assistant"],
++            });
++            expect(result.message_refs).toEqual([
++                { message_id: "answer-id", run_id: "real-run-id", position: 0, role: "assistant" },
++            ]);
++            expect(JSON.stringify(result)).not.toContain("private-id");
++            expect(JSON.stringify(result)).not.toContain("user-id");
++            expect((await call({ target: "agent-b", query: "other" })).message_refs).toEqual([
++                { message_id: "runless-id", position: 1, role: "assistant" },
++            ]);
++            await expect(call({ target: "outsider" })).rejects.toThrow("only the bot's own agents");
++        } finally {
++            database.close();
++        }
++    });
+     it("normalizes all from aliases and continues with stable cursors", async () => {
+         const history = new HistoryModule();
+         const database = moduleDatabase(history.migrations, "history-tool-aliases");
+@@ -53,10 +105,16 @@ describe("read_agent_history", () => {
+                 target: "agent-a",
+             });
+             expect(first.history).toContain("message-0");
++            expect(first.message_refs).toEqual([
++                { message_id: "record-0", position: 0, role: "assistant" },
++            ]);
+             expect(first.next_cursor).toBe(1);
+ 
+             const second = await call({ cursor: first.next_cursor, limit: 1 });
+             expect(second.history).toContain("message-1");
++            expect(second.message_refs).toEqual([
++                { message_id: "record-1", position: 1, role: "assistant" },
++            ]);
+             expect(second.cursor).toBe(1);
+             expect(second.previous_cursor).toBe(0);
+ 
+@@ -151,6 +209,9 @@ describe("read_agent_history", () => {
+             expect(result.returned_messages).toBe(1);
+             expect(result.history).not.toContain("Tool call:");
+             expect(result.history).not.toContain("Tool result:");
++            expect(result.message_refs).toEqual([
++                { message_id: "record-tools", position: 0, role: "assistant" },
++            ]);
+             expect((result.stats as Record<string, unknown>).matched).toMatchObject({
+                 tool_calls: 1,
+                 tool_results: 1,
+@@ -220,6 +281,15 @@ describe("read_agent_history", () => {
+             expect(first.matched_messages).toBe(8);
+             expect(first.returned_messages).toBeLessThan(8);
+             expect(first.next_cursor).toBe(first.returned_messages);
++            const references = first.message_refs as { message_id: string; position: number }[];
++            expect(references.map((reference) => reference.position)).toEqual(
++                Array.from({ length: first.returned_messages as number }, (_, index) => index),
++            );
++            expect(
++                (first.history as string).length +
++                    JSON.stringify({ message_refs: references }).length,
++            ).toBeLessThanOrEqual(80_000);
++            expect(references.some((reference) => reference.message_id === "record-7")).toBe(false);
+ 
+             const next = (await tool.execute(
+                 database.context,
+diff --git a/packages/happy-agent-modules/tests/history/executionDiagnosticsStayOutOfModelContext.test.ts b/packages/happy-agent-modules/tests/history/executionDiagnosticsStayOutOfModelContext.test.ts
+index a9ea3f8..f94225c 100644
+--- a/packages/happy-agent-modules/tests/history/executionDiagnosticsStayOutOfModelContext.test.ts
++++ b/packages/happy-agent-modules/tests/history/executionDiagnosticsStayOutOfModelContext.test.ts
+@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
+ import { messageResource } from "../../sources/api/ApiMessageProjection.js";
+ import { HistoryModule, type HistoryMessage } from "../../sources/history/index.js";
+ import { formatHistoryMessage } from "../../sources/history/impl/formatHistoryMessage.js";
++import { formatHistoryPage } from "../../sources/history/impl/formatHistoryPage.js";
++import { summarizeHistory } from "../../sources/history/impl/summarizeHistory.js";
+ import {
+     configuration,
+     diagnostic,
+@@ -55,6 +57,21 @@ describe("execution diagnostics are display-only history", () => {
+             blocks: [configuration],
+         } as unknown as HistoryMessage;
+         expect(formatHistoryMessage(message, 0)).toBe("");
++        const stats = summarizeHistory([message]);
++        const formatted = formatHistoryPage(
++            {
++                agentId: "agent-a",
++                cursor: 0,
++                messages: [{ message, position: 0 }],
++                matchedMessages: 1,
++                totalMessages: 1,
++                matchedStats: stats,
++                totalStats: stats,
++            },
++            { includeMessageReferences: true },
++        );
++        expect(formatted.history).toBe("");
++        expect(formatted.messageRefs).toEqual([]);
+     });
+ 
+     it("preserves unrelated prose beside a configuration block without exposing its snapshot", () => {
+diff --git a/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts b/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts
+index fedd2c4..a2056e3 100644
+--- a/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts
++++ b/packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts
+@@ -10,7 +10,11 @@ import { afterEach, expect, it, vi } from "vitest";
+ import { DurableFunctionsModule } from "../../sources/durableFunctions/index.js";
+ import { SurfacesModule } from "../../sources/surfaces/index.js";
+ import { SurfacesPersistence } from "../../sources/surfaces/persistence/SurfacesPersistence.js";
+-import type { HistoryModule, HistoryRunState } from "../../sources/history/index.js";
++import {
++    HistoryModule,
++    readAgentHistoryTool,
++    type HistoryRunState,
++} from "../../sources/history/index.js";
+ import type { TeamModule } from "../../sources/team/index.js";
+ import type { BotsModule } from "../../sources/bots/index.js";
+ import type { TasksModule } from "../../sources/tasks/index.js";
+@@ -30,7 +34,7 @@ afterEach(() =>
+         .forEach((dispose) => dispose()),
+ );
+ 
+-async function fixture() {
++async function fixture(realHistory?: HistoryModule) {
+     const coordinator = createId(),
+         child = createId(),
+         outsider = createId(),
+@@ -45,14 +49,16 @@ async function fixture() {
+     const artifacts = new Set<string>();
+     const archived = new Set<string>();
+     const durable = new DurableFunctionsModule();
+-    const history = {
+-        run: async (_ctx: unknown, agentId: string, runId: string) => {
+-            const run = runs.get(runId);
+-            return run?.agentId === agentId ? run : undefined;
+-        },
+-        message: async (_ctx: unknown, agentId: string, messageId: string) =>
+-            messages.has(agentId + ":" + messageId) ? { recordId: messageId } : undefined,
+-    } as unknown as HistoryModule;
++    const history =
++        realHistory ??
++        ({
++            run: async (_ctx: unknown, agentId: string, runId: string) => {
++                const run = runs.get(runId);
++                return run?.agentId === agentId ? run : undefined;
++            },
++            message: async (_ctx: unknown, agentId: string, messageId: string) =>
++                messages.has(agentId + ":" + messageId) ? { recordId: messageId } : undefined,
++        } as unknown as HistoryModule);
+     const surfaces = new SurfacesModule(
+         durable,
+         { enabled: false } as TeamModule,
+@@ -75,7 +81,7 @@ async function fixture() {
+         { workspaceForAgent: async () => undefined } as unknown as WorkspacesModule,
+     );
+     const db = moduleDatabase(
+-        [...durable.migrations, ...surfaces.migrations],
++        [...(realHistory?.migrations ?? []), ...durable.migrations, ...surfaces.migrations],
+         "todo-execution-test",
+     );
+     ensureAgentDatabaseConnection(db.database);
+@@ -136,6 +142,70 @@ async function fixture() {
+     };
+ }
+ 
++it("binds a real completed child run and evidence obtained through the readable history tool", async () => {
++    const history = new HistoryModule();
++    const f = await fixture(history);
++    const runId = createId(),
++        messageId = createId();
++    await history.beginMaintenanceRun(f.db.context, f.child, runId, 100);
++    await history.record(f.db.context, f.child, {
++        recordId: messageId,
++        runId,
++        role: "assistant",
++        at: 120,
++        blocks: [{ type: "text", text: "18 × 27 = 486" }],
++    });
++    await history.finishMaintenanceRun(f.db.context, f.child, runId, "completed", 150);
++    const result = await readAgentHistoryTool(history, f.coordinator).execute(
++        f.db.context,
++        { target: f.child, roles: ["assistant"], from: "end", limit: 1 },
++        { id: createId(), kv: {} } as never,
++    );
++    const reference = result.message_refs?.[0];
++    expect(reference).toMatchObject({ message_id: messageId, run_id: runId });
++    if (reference?.run_id === undefined) throw new Error("Authoritative run reference missing");
++    const running = await f.update(await f.create(), {
++        execution: { assigneeAgentId: f.child, phase: "in_progress", runId: reference.run_id },
++    });
++    await expect(
++        f.update(
++            running,
++            {
++                execution: {
++                    phase: "completed",
++                    evidence: [
++                        {
++                            kind: "agent_message",
++                            agentId: f.child,
++                            messageId: reference.message_id,
++                        },
++                    ],
++                },
++            },
++            f.child,
++        ),
++    ).rejects.toMatchObject({ code: "forbidden" });
++    await expect(f.update(running, { execution: { phase: "completed" } })).rejects.toMatchObject({
++        code: "invalid_request",
++    });
++    const done = await f.update(running, {
++        execution: {
++            phase: "completed",
++            evidence: [
++                { kind: "agent_message", agentId: f.child, messageId: reference.message_id },
++            ],
++        },
++    });
++    expect(done).toMatchObject({
++        status: "completed",
++        execution: {
++            phase: "completed",
++            attempt: { runId, finishedAt: 150 },
++            verification: { agentId: f.coordinator },
++        },
++    });
++});
++
+ it("preserves plain todos and records execution phases, evidence and authoritative run times", async () => {
+     const f = await fixture();
+     const plain = await f.surfaces.createTodo(
+diff --git a/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts b/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts
+index 10273e0..ca58217 100644
+--- a/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts
++++ b/packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts
+@@ -605,6 +605,6 @@ async function waitForArchived(
+         async () => {
+             expect((await world.workspaces.get(world.ctx, workspaceId))?.status).toBe("archived");
+         },
+-        { timeout },
++        timeout === undefined ? {} : { timeout },
+     );
+ }
+diff --git a/packages/happy-agent/scripts/build-binary.ts b/packages/happy-agent/scripts/build-binary.ts
+index a2e8501..909d70b 100644
+--- a/packages/happy-agent/scripts/build-binary.ts
++++ b/packages/happy-agent/scripts/build-binary.ts
+@@ -15,6 +15,7 @@ import { orderIconLargestFirst } from "./orderIconLargestFirst.js";
+ import { resolveBinaryVersion } from "./resolveBinaryVersion.js";
+ import { resolveTailcatBinaryAsset } from "./resolveTailcatBinaryAsset.js";
+ import { windowsExecutableVersion } from "./windowsExecutableVersion.js";
++import { verifyProviderBinding } from "./verifyProviderBinding.js";
+ 
+ const MINIMUM_BUN_VERSION = [1, 4, 3] as const;
+ const VIRTUAL_ASSETS_MODULE = "happy-agent:binary-assets";
+@@ -111,6 +112,11 @@ async function main(): Promise<void> {
+     if (!existsSync(join(happyAgentRoot, "dist", "cli.js"))) {
+         throw new Error("Build Happy Agent before compiling a binary (run pnpm build).");
+     }
++    const providerSearchHash = verifyProviderBinding(
++        directPackageRoot("@slopus/happy-providers"),
++        join(happyAgentRoot, "..", "happy-providers"),
++    );
++    console.log(`Verified bundled provider discovery module: ${providerSearchHash}`);
+     const targets = selectTargets(process.argv.slice(2));
+     await mkdir(join(happyAgentRoot, "dist", "bin"), { recursive: true });
+     for (const target of targets) {
+diff --git a/packages/happy-agent/scripts/verifyProviderBinding.ts b/packages/happy-agent/scripts/verifyProviderBinding.ts
+new file mode 100644
+index 0000000..fad4ce4
+--- /dev/null
++++ b/packages/happy-agent/scripts/verifyProviderBinding.ts
+@@ -0,0 +1,29 @@
++import { createHash } from "node:crypto";
++import { readFileSync } from "node:fs";
++import { join } from "node:path";
++
++const FIXED_SEARCH_SHA256 = "8105df6311ca2a7f9c36094cc5a1855721a2aee5eab8dad77ba55d7523eddd96";
++const SEARCH_PATH = "dist/vendors/codex/impl/searchCodexTools.js";
++
++/** Fail before bundling if the published provider lacks the reviewed discovery fix. */
++export function verifyProviderBinding(providerRoot: string, compiledProviderRoot: string): string {
++    const manifest = JSON.parse(readFileSync(join(providerRoot, "package.json"), "utf8")) as {
++        name?: unknown;
++        version?: unknown;
++    };
++    if (manifest.name !== "@slopus/happy-providers" || manifest.version !== "0.0.53") {
++        throw new Error("The standalone build requires the pinned happy-providers 0.0.53 package.");
++    }
++    const compiled = readFileSync(join(compiledProviderRoot, SEARCH_PATH));
++    const hash = createHash("sha256").update(compiled).digest("hex");
++    if (hash !== FIXED_SEARCH_SHA256) {
++        throw new Error("Build the reviewed happy-providers discovery fix before bundling.");
++    }
++    const installed = readFileSync(join(providerRoot, SEARCH_PATH));
++    if (!installed.equals(compiled)) {
++        throw new Error(
++            "The resolved happy-providers discovery module differs from the reviewed build; install the frozen patched lockfile.",
++        );
++    }
++    return hash;
++}
+diff --git a/packages/happy-agent/tests/verifyProviderBinding.test.ts b/packages/happy-agent/tests/verifyProviderBinding.test.ts
+new file mode 100644
+index 0000000..2cef130
+--- /dev/null
++++ b/packages/happy-agent/tests/verifyProviderBinding.test.ts
+@@ -0,0 +1,71 @@
++import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join, resolve } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++
++import { verifyProviderBinding } from "../scripts/verifyProviderBinding.js";
++
++const owned: string[] = [];
++const searchPath = "dist/vendors/codex/impl/searchCodexTools.js";
++
++function fixture() {
++    const root = mkdtempSync(join(tmpdir(), "cyberfi-provider-binding-"));
++    owned.push(root);
++    const installed = join(root, "installed");
++    const compiled = join(root, "compiled");
++    const bytes = readFileSync(
++        resolve(import.meta.dirname, "../../happy-providers/dist", searchPath.slice(5)),
++    );
++    for (const path of [installed, compiled]) {
++        mkdirSync(dirname(join(path, searchPath)), { recursive: true });
++        writeFileSync(join(path, searchPath), bytes);
++    }
++    writeFileSync(
++        join(installed, "package.json"),
++        JSON.stringify({ name: "@slopus/happy-providers", version: "0.0.53" }),
++    );
++    return { installed, compiled };
++}
++
++afterEach(() => {
++    for (const root of owned.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("standalone provider binding", () => {
++    it("accepts the exact reviewed compiled search module", () => {
++        const { installed, compiled } = fixture();
++        expect(verifyProviderBinding(installed, compiled)).toBe(
++            "8105df6311ca2a7f9c36094cc5a1855721a2aee5eab8dad77ba55d7523eddd96",
++        );
++    });
++    it("rejects an unpatched published provider", () => {
++        const { installed, compiled } = fixture();
++        writeFileSync(join(installed, searchPath), "// stale published module\n");
++        expect(() => verifyProviderBinding(installed, compiled)).toThrow(
++            "differs from the reviewed build",
++        );
++    });
++    it("rejects a missing compiled source", () => {
++        const { installed, compiled } = fixture();
++        rmSync(join(compiled, searchPath));
++        expect(() => verifyProviderBinding(installed, compiled)).toThrow();
++    });
++    it("rejects matching but stale installed and compiled modules", () => {
++        const { installed, compiled } = fixture();
++        for (const root of [installed, compiled])
++            writeFileSync(join(root, searchPath), "// stale\n");
++        expect(() => verifyProviderBinding(installed, compiled)).toThrow(
++            "reviewed happy-providers discovery fix",
++        );
++    });
++    it("rejects a different provider version", () => {
++        const { installed, compiled } = fixture();
++        writeFileSync(
++            join(installed, "package.json"),
++            JSON.stringify({ name: "@slopus/happy-providers", version: "0.0.48" }),
++        );
++        expect(() => verifyProviderBinding(installed, compiled)).toThrow(
++            "pinned happy-providers 0.0.53",
++        );
++    });
++});
+diff --git a/packages/happy-providers/sources/vendors/codex/impl/searchCodexTools.ts b/packages/happy-providers/sources/vendors/codex/impl/searchCodexTools.ts
+index 21956d7..084a5af 100644
+--- a/packages/happy-providers/sources/vendors/codex/impl/searchCodexTools.ts
++++ b/packages/happy-providers/sources/vendors/codex/impl/searchCodexTools.ts
+@@ -19,6 +19,18 @@ export function searchCodexTools<T extends SessionTool>(
+         throw new Error("limit must be a positive integer");
+     if (tools.length === 0) return [];
+ 
++    // An explicit catalog identity must beat a shorter tool that merely mentions it.
++    // Keep ordinary prose queries on BM25; do not match substrings or foreign namespaces.
++    const identifiers = new Set(
++        normalizedQuery
++            .split(/\s+/u)
++            .filter(
++                (token) =>
++                    token.startsWith("+") || /[_.-]/u.test(token) || token === normalizedQuery,
++            )
++            .map((token) => token.replace(/^\+/u, "")),
++    );
++
+     const tokenize = (text: string): string[] =>
+         Array.from(
+             segmenter.segment(
+@@ -106,8 +118,17 @@ export function searchCodexTools<T extends SessionTool>(
+                                     (averageDocumentLength === 0 ? 256 : averageDocumentLength))));
+             score += inverseDocumentFrequency * normalizedFrequency;
+         }
+-        return score === 0 ? [] : [{ index, score }];
++        const tool = tools[index]!;
++        const exact =
++            identifiers.has(tool.name) ||
++            identifiers.has(`${tool.namespace ?? "functions"}.${tool.name}`);
++        return score === 0 && !exact ? [] : [{ index, score, exact }];
+     });
+-    scored.sort((left, right) => right.score - left.score || left.index - right.index);
++    scored.sort(
++        (left, right) =>
++            Number(right.exact) - Number(left.exact) ||
++            right.score - left.score ||
++            left.index - right.index,
++    );
+     return scored.slice(0, limit).map(({ index }) => tools[index]!);
+ }
+diff --git a/packages/happy-providers/tests/vendors/codexToolSearch.test.ts b/packages/happy-providers/tests/vendors/codexToolSearch.test.ts
+index f6d7d8f..2c23c21 100644
+--- a/packages/happy-providers/tests/vendors/codexToolSearch.test.ts
++++ b/packages/happy-providers/tests/vendors/codexToolSearch.test.ts
+@@ -33,7 +33,75 @@ const clientToolSearch = {
+     server: { type: "tool_search", execution: "client" },
+ } as const satisfies SessionTool;
+ 
++// Caller metadata from the real manager's creator and referring switch tool.
++// The long creator description lost limit=1 searches to its shorter cross-reference.
++const subtaskTools = [
++    {
++        name: "create_subtask",
++        description: [
++            "Create a user-visible subtask you coordinate. Only bots, tasks, and subtasks may create one; depth is limited to two levels below a bot or task, not two siblings.",
++            "Reserve subtasks for substantial, distinct workstreams, such as changes across projects; handle small steps inline. Usually create second-level subtasks only on explicit user request. Honor explicit subtask requests; use create_agent for internal research.",
++            "Sidebar title: prefer 2–3 words; 4 at most, as a last resort. Put details in text.",
++            "Omit workspace to share your filesystem, or supply workspace with projectId and a short name for a new workspace. Work starts after setup.",
++            "The subtask inherits your persistent permission mode. The person's Full access grant stays Full access for every descendant, even if read_only is requested. In other modes, read_only narrows access; full_mode cannot widen your own mode.",
++            "Returns the agent ID without waiting. Coordinate via send_agent_message and archive direct subtasks with archive_subtask. Users can message or archive them. There is no wait tool.",
++            "Keep delegated work in the subtask. Ask its agent through send_agent_message for progress, findings, diffs, verification, or follow-up changes. Do not directly inspect or modify its files or run commands in its workspace. Direct access to another workspace often requires elevated permissions and review by the reviewer model; talking to its agent avoids unnecessary permission reviews.",
++            "Choose a model and effort; harness and provider default to yours when they serve the model. Call agent_options for the current list.",
++        ].join("\n\n"),
++        searchKeywords: ["subtask", "delegate work", "project subtask", "workspace subtask"],
++        parameters: Type.Object({
++            title: Type.String(),
++            text: Type.String(),
++            model: Type.String(),
++        }),
++        defer: true,
++    },
++    {
++        name: "switch_subtask_model",
++        description: [
++            "Switch one of your direct subtasks to another model, effort, provider, or service tier. Only its coordinating bot, task, or subtask may do this.",
++            "Choose from the same options as create_subtask, listed by agent_options; harness and provider default to yours when they serve the model.",
++            "This sends the subtask a short message from you carrying the new model, exactly as a person switches models from its conversation. A working subtask switches after its current step and carries on; an idle one wakes on the new model and replies briefly. A model that cannot read the earlier conversation starts fresh with a handoff notice.",
++            "Keep a subtask on one model unless its model is failing or wrong for the work. To give it new instructions as well, use send_agent_message with the same model fields instead.",
++        ].join("\n\n"),
++        searchKeywords: [
++            "switch subtask model",
++            "change subtask provider",
++            "subtask effort",
++            "change subtask model",
++        ],
++        parameters: Type.Object({ agentId: Type.String(), model: Type.String() }),
++        defer: true,
++    },
++] as const satisfies readonly SessionTool[];
++
+ describe("Codex tool search", () => {
++    it.each(["+create_subtask", "create_subtask", "functions.create_subtask"])(
++        "loads the exact requested tool before shorter referring metadata: %s",
++        (query) => {
++            expect(searchCodexTools(subtaskTools, query, 1)).toEqual([subtaskTools[0]]);
++        },
++    );
++
++    it("respects the actual namespace and does not promote substrings or foreign qualifiers", () => {
++        const namespaced = subtaskTools.map((tool) => ({ ...tool, namespace: "collaboration" }));
++        expect(searchCodexTools(namespaced, "+collaboration.create_subtask", 1)).toEqual([
++            namespaced[0],
++        ]);
++        expect(searchCodexTools(namespaced, "foreign.create_subtask", 1)).toEqual([]);
++        expect(searchCodexTools(subtaskTools, "+other_create_subtask", 1)).toEqual([]);
++        expect(searchCodexTools([subtaskTools[1]], "+create_subtask", 1)).toEqual([
++            subtaskTools[1],
++        ]);
++    });
++
++    it("keeps ordinary relevance and validates limits before exact-name selection", () => {
++        expect(searchCodexTools(subtaskTools, "switch model", 1)).toEqual([subtaskTools[1]]);
++        expect(searchCodexTools(subtaskTools, "unknown weather forecast", 1)).toEqual([]);
++        for (const limit of [0, -1, Number.MAX_SAFE_INTEGER + 1]) {
++            expect(() => searchCodexTools(subtaskTools, "+create_subtask", limit)).toThrow();
++        }
++    });
+     it("ranks tool names, descriptions, and parameter metadata", () => {
+         expect(searchCodexTools(tools, "create calendar meeting")).toEqual([tools[0]]);
+         expect(searchCodexTools(tools, "IANA timezones")).toEqual([tools[0]]);
+diff --git a/patches/@slopus__happy-providers@0.0.53.patch b/patches/@slopus__happy-providers@0.0.53.patch
+new file mode 100644
+index 0000000..91bb790
+--- /dev/null
++++ b/patches/@slopus__happy-providers@0.0.53.patch
+@@ -0,0 +1,33 @@
++diff --git a/dist/vendors/codex/impl/searchCodexTools.js b/dist/vendors/codex/impl/searchCodexTools.js
++--- a/dist/vendors/codex/impl/searchCodexTools.js
+++++ b/dist/vendors/codex/impl/searchCodexTools.js
++@@ -13,6 +13,12 @@
++         throw new Error("limit must be a positive integer");
++     if (tools.length === 0)
++         return [];
+++    // An explicit catalog identity must beat a shorter tool that merely mentions it.
+++    // Keep ordinary prose queries on BM25; do not match substrings or foreign namespaces.
+++    const identifiers = new Set(normalizedQuery
+++        .split(/\s+/u)
+++        .filter((token) => token.startsWith("+") || /[_.-]/u.test(token) || token === normalizedQuery)
+++        .map((token) => token.replace(/^\+/u, "")));
++     const tokenize = (text) => Array.from(segmenter.segment(deunicode(text)
++         .normalize("NFKD")
++         .replace(/\p{Mark}/gu, "")
++@@ -96,9 +102,14 @@
++                                     (averageDocumentLength === 0 ? 256 : averageDocumentLength))));
++             score += inverseDocumentFrequency * normalizedFrequency;
++         }
++-        return score === 0 ? [] : [{ index, score }];
+++        const tool = tools[index];
+++        const exact = identifiers.has(tool.name) ||
+++            identifiers.has(`${tool.namespace ?? "functions"}.${tool.name}`);
+++        return score === 0 && !exact ? [] : [{ index, score, exact }];
++     });
++-    scored.sort((left, right) => right.score - left.score || left.index - right.index);
+++    scored.sort((left, right) => Number(right.exact) - Number(left.exact) ||
+++        right.score - left.score ||
+++        left.index - right.index);
++     return scored.slice(0, limit).map(({ index }) => tools[index]);
++ }
++ //# sourceMappingURL=searchCodexTools.js.map
+\ No newline at end of file
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 5673be1..76aa1ef 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -17,6 +17,9 @@ patchedDependencies:
+   '@parcel/watcher@2.6.0':
+     hash: a595e20a32e8eff3ee4484f4fcb3c627b188f13e7dbd03be03547caf54ae4bbd
+     path: patches/@parcel__watcher@2.6.0.patch
++  '@slopus/happy-providers@0.0.53':
++    hash: ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c
++    path: patches/@slopus__happy-providers@0.0.53.patch
+   libsql@0.5.29:
+     hash: b0b8f583a51a91e4873f7198c6d8aa4679534b7f0bfe9674ab52edd05ac943c7
+     path: patches/libsql@0.5.29.patch
+@@ -99,7 +102,7 @@ importers:
+         version: 0.0.20
+       '@slopus/happy-providers':
+         specifier: 0.0.53
+-        version: 0.0.53(ws@8.21.1)(zod@4.4.3)
++        version: 0.0.53(patch_hash=ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c)(ws@8.21.1)(zod@4.4.3)
+       '@steve.kite/stdlib':
+         specifier: 0.0.12
+         version: 0.0.12
+@@ -139,7 +142,7 @@ importers:
+         version: 0.34.49
+       '@slopus/happy-providers':
+         specifier: 0.0.53
+-        version: 0.0.53(ws@8.21.1)(zod@4.4.3)
++        version: 0.0.53(patch_hash=ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c)(ws@8.21.1)(zod@4.4.3)
+       '@steve.kite/stdlib':
+         specifier: 0.0.12
+         version: 0.0.12
+@@ -254,7 +257,7 @@ importers:
+         version: link:../happy-agent-modules
+       '@slopus/happy-providers':
+         specifier: 0.0.53
+-        version: 0.0.53(ws@8.21.1)(zod@4.4.3)
++        version: 0.0.53(patch_hash=ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c)(ws@8.21.1)(zod@4.4.3)
+       '@steve.kite/stdlib':
+         specifier: 0.0.12
+         version: 0.0.12
+@@ -378,7 +381,7 @@ importers:
+         version: 0.1.30
+       '@slopus/happy-providers':
+         specifier: 0.0.53
+-        version: 0.0.53(ws@8.21.1)(zod@4.4.3)
++        version: 0.0.53(patch_hash=ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c)(ws@8.21.1)(zod@4.4.3)
+       '@steve.kite/stdlib':
+         specifier: 0.0.12
+         version: 0.0.12
+@@ -5263,7 +5266,7 @@ snapshots:
+       '@libsql/client': 0.18.0(patch_hash=90434d5ce5f0f99730247b66b6916a4a40d3019cdf938903efa57e36177f75f8)
+       '@paralleldrive/cuid2': 3.3.0
+       '@sinclair/typebox': 0.34.49
+-      '@slopus/happy-providers': 0.0.53(ws@8.21.1)(zod@4.4.3)
++      '@slopus/happy-providers': 0.0.53(patch_hash=ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c)(ws@8.21.1)(zod@4.4.3)
+       '@steve.kite/stdlib': 0.0.12
+       drizzle-orm: 0.45.2(@electric-sql/pglite@0.5.5)(@libsql/client@0.18.0(patch_hash=90434d5ce5f0f99730247b66b6916a4a40d3019cdf938903efa57e36177f75f8))(@opentelemetry/api@1.9.1)(@types/pg@8.15.6)(postgres@3.4.9)(sql.js@1.14.1)
+       postgres: 3.4.9
+@@ -5348,7 +5351,7 @@ snapshots:
+   '@slopus/happy-agent-supervisor@0.0.20-win32-x64':
+     optional: true
+ 
+-  '@slopus/happy-providers@0.0.53(ws@8.21.1)(zod@4.4.3)':
++  '@slopus/happy-providers@0.0.53(patch_hash=ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c)(ws@8.21.1)(zod@4.4.3)':
+     dependencies:
+       '@agentclientprotocol/sdk': 1.9.0(zod@4.4.3)
+       '@anthropic-ai/bedrock-sdk': 0.32.0(zod@4.4.3)

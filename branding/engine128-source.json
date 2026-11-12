@@ -1,0 +1,31 @@
+{
+  "canonicalSourceCommit": "28203c23edc5a6d30c6f908601618b3abd25ba99",
+  "canonicalPreviousCommit": "3095a00be304f82fade6755b27fefaa2b69f135e",
+  "upstreamSourceCommit": "3d672e414d70804cf9f1b20b44d7243c78e063c3",
+  "engineVersion": "0.4.128",
+  "incrementalPatch": "provider-history-completion.patch",
+  "incrementalPatchSha256": "fa8a6d0921787efb5b40cfdeeb896cf05980a6bdb78a4cd7d584949a8e39bb60",
+  "sourceFiles": {
+    "package.json": "b4c639a4ba8763e50fea027a077e11d70e9900bdd7a0c5c96befbc0f63570a9b",
+    "packages/happy-agent-modules/sources/history/LEARNINGS.md": "02dba1824891103916c1553a5fd0412534a32013eaf1e1740c191ed8338f3572",
+    "packages/happy-agent-modules/sources/history/impl/formatHistoryPage.ts": "d0116b0fb1f83fb3287e3b5bad07cb637b0bea2b3b6b7cdb1fb51ae4b5ef6515",
+    "packages/happy-agent-modules/sources/history/tools/read_agent_history.ts": "036e5a06bd2968377457ebc9fe89f7a40011a06827ce0da12e87678ed7fb53d0",
+    "packages/happy-agent-modules/sources/surfaces/tools/surfaceTools.ts": "0d41a7308e20a4b6a4b44f3e2d2d836992e142526bc5e636cff226138ea9348c",
+    "packages/happy-agent-modules/tests/auto/AutoModuleReview.test.ts": "f768934746a42d03ec21bcb5699921e589e296052c7dd1dc07646f0cf6554669",
+    "packages/happy-agent-modules/tests/history/HistoryFormatting.test.ts": "c7df1fc68e54c0e636dda978c9d73e1f9a23163e9be66a531d0b2c2c0f43833f",
+    "packages/happy-agent-modules/tests/history/HistoryTool.test.ts": "55bf64edf9b524b69377b1347c1918da8311d31a60af88c32702efff709a48f8",
+    "packages/happy-agent-modules/tests/history/executionDiagnosticsStayOutOfModelContext.test.ts": "0b147cb736def11ab2d65604bf43d7c5956d9eb33cb58340063a865a98c8bb80",
+    "packages/happy-agent-modules/tests/surfaces/TodoExecution.test.ts": "7932556d67a323fd3fb0e7d553a4989905c6067e4ee89ff4f41c5926577cc4ca",
+    "packages/happy-agent-modules/tests/workspaces/WorkspaceArchiveStopsWork.test.ts": "38616f5765060891ac9debbab0217942755423a077a524c032e991f0526dcbdb",
+    "packages/happy-agent/scripts/build-binary.ts": "1e857575b0f899717e0355a2b4a92d8844a377a9ec3b5545499aef76842e8332",
+    "packages/happy-agent/scripts/verifyProviderBinding.ts": "5ae09a4768963bace99ec7c33e7bd95a991a5cf41b6be23daf8b0ebe1e2c60d5",
+    "packages/happy-agent/tests/verifyProviderBinding.test.ts": "1f7ac0fefb60def4497bba141ff3215d704d903f3fa7680f836aa62a9d6a4a16",
+    "packages/happy-providers/sources/vendors/codex/impl/searchCodexTools.ts": "78e09934ce77a4164e1b1102006e53a1c60d28f47610aabe4d54966dda64e5b7",
+    "packages/happy-providers/tests/vendors/codexToolSearch.test.ts": "42fbd0efece7dad7b7c66d5f8c59a9a6d0c7a2463fa826efd1b05f66eba65c36",
+    "patches/@slopus__happy-providers@0.0.53.patch": "ebbb68d5fbd47dc78c95ff0d3845dee263e306b830eeca6837c5e2d00c84047c",
+    "pnpm-lock.yaml": "d3632a7e394ca4e145651075658632ac53836747cddc00ef8bd014236d806a65"
+  },
+  "providerRuntimeSha256": "8105df6311ca2a7f9c36094cc5a1855721a2aee5eab8dad77ba55d7523eddd96",
+  "canaryBinarySha256": "01f255ed9deb05502b7d8ecad75b89d7e8566ad193af64144e1229e278c44692",
+  "publication": "draft-only"
+}

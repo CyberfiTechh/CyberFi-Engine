@@ -188,6 +188,11 @@ jobs:
               run: pnpm --filter @slopus/happy-agent-modules exec vitest run tests/workspaces/WorkspaceArchiveStopsWork.test.ts --maxWorkers=1
             - name: Build workspace JavaScript
               run: pnpm build
+            - name: Verify exact provider binding and evidence-backed child completion
+              run: |
+                  pnpm --filter @slopus/happy-providers exec vitest run tests/vendors/codexToolSearch.test.ts --maxWorkers=1
+                  pnpm --filter @slopus/happy-agent exec vitest run tests/verifyProviderBinding.test.ts --maxWorkers=1
+                  pnpm --filter @slopus/happy-agent-modules exec vitest run tests/history/HistoryFormatting.test.ts tests/history/HistoryTool.test.ts tests/history/executionDiagnosticsStayOutOfModelContext.test.ts tests/surfaces/TodoExecution.test.ts tests/auto/AutoModuleReview.test.ts tests/workspaces/WorkspaceArchiveStopsWork.test.ts --maxWorkers=1
             - name: Verify source named-pipe transports before signing and compiling
               run: |
                   pnpm --filter @slopus/happy-agent exec pnpm dlx bun@1.4.4 scripts/verify-windows-sockets.ts
